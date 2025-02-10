@@ -11,6 +11,9 @@ from torch.utils.data import Dataset, DataLoader
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
+from pathlib import Path
+import logging
+
 class UECFoodDataset(Dataset):
     def __init__(self, root_dir:str, transform:Callable, image_ext:str):
         """
@@ -19,7 +22,7 @@ class UECFoodDataset(Dataset):
             transform (callable, optional): Albumentations transformation pipeline.
             image_ext (str): Extension of the image files (default '.jpg').
         """
-        self.root_dir = root_dir
+        self.root_dir = Path(root_dir)
         self.transform = transform
         self.image_ext = image_ext
         self.data = []            # Each dict corresponds to one image
@@ -47,7 +50,7 @@ class UECFoodDataset(Dataset):
                 cat_name = ' '.join(parts[1:])
                 self.id_to_category[cat_id] = cat_name
         else:
-            print(f"⚠️ Warning: category.txt not found in the root directory.")
+            logging.warning(f"⚠️ Warning: category.txt not found in the root directory.")
             self.id_to_category = None
 
     def _load_dataset(self):
@@ -58,12 +61,12 @@ class UECFoodDataset(Dataset):
             try:
                 label = int(category)
             except ValueError:
-                print(f"⚠️ Warning: Folder name '{category} is not numeric . Skipping...'")
+                logging.warning(f"⚠️ Warning: Folder name '{category} is not numeric . Skipping...'")
 
             # The annotation file in the folder
             bb_info_file = os.path.join(category_path, "bb_info.txt")
             if not os.path.exists(bb_info_file):
-                print(f"⚠️ Warning: {bb_info_file} not found. Skipping folder {category}...")
+                logging.warning(f"⚠️ Warning: {bb_info_file} not found. Skipping folder {category}...")
                 continue
 
             # Read bounding box and group by image id
@@ -94,7 +97,7 @@ class UECFoodDataset(Dataset):
                 self.data.append({"image_path":image_path,
                                   "bboxes":bboxes,
                                   "label":label})
-    def len(self):
+    def __len__(self):
         return len(self.data)
     def __getitem__(self, idx):
         item = self.data[idx]
@@ -108,21 +111,31 @@ class UECFoodDataset(Dataset):
         labels = [item["label"]]*len(bboxes)
 
         if self.transform:
-            transformed = self.transform(image = image, bboxes=bboxes, labels = labels)
+            transformed = self.transform(image=image, bboxes=bboxes, labels=labels)
             image = transformed["image"]
-            bboxes = transformed["bboxes"]
+            bboxes = transformed["bboxes"] # Transformed PascalVoc
             labels = transformed["labels"]
-        target = {"boxes":torch.tensor(bboxes, dtype = torch.float32), # Shape: [num_boxes,4]
+
+        # Convert to YOLO format (normalized x,y,w,h)
+        height, width = image.shape[1], image.shape[2] # Transformed image shape (C,H,W)
+        yolo_boxes = []
+        for (x1, y1, x2, y2) in bboxes:
+            x_center = ((x1+y2)/2)/width
+            y_center = ((y1+y2)/2)/height
+            w = (x2-y1)/width
+            h = (y2-y1)/height
+            yolo_boxes.append([x_center, y_center, w, h])
+
+        target = {"boxes":torch.tensor(yolo_boxes, dtype = torch.float32), # Shape: [num_boxes,4]
                   "labels":torch.tensor(labels, dtype = torch.int64)}  # Shape: [num_boxes]
         return image, target
 
-# -------------------------
 # Define Augmentations
 # -------------------------
 # Training augmentations include resizing, cropping, flips, brightness/contrast adjustments,
 # and geometric transformations. The bounding boxes are transformed accordingly.
 
-train_transform = A.Compose([A.Resize(height=256, width=256),
+train_transform = A.Compose([A.Resize(height=640, width=640),
                              A.RandomCrop(height=224, width=224),
                              A.HorizontalFlip(p=0.5),
                              A.RandomBrightnessContrast(p=0.2),
@@ -140,5 +153,37 @@ val_transform = A.Compose([A.Resize(height=224, width=224),
                                                                    label_fields=["labels"]))
 
 
+# Custom Collate Function
+def collate_fn(batch):
+    images = []
+    targets = []
+    for img, target in batch:
+        images.append(img)
+        # Combine labels and boxes into [class_id, x, y, w, h]
+        yolotarget = torch.cat([target["labels"].unsqueeze(1),
+                                target["boxes"]], dim = 1)
+        targets.append(yolotarget)
+    images = torch.stack(images, dim = 0)
+    return images, targets
 
 
+# Creating DataLoaders
+dataset_root = ""
+train_dataset = UECFoodDataset(root_dir = dataset_root, transform = train_transform)
+val_dataset = UECFoodDataset(root_dir = dataset_root, transform = val_transform)
+train_loader = DataLoader(train_dataset, batch_size = 32,
+                           shuffle = True, num_workers = 4,
+                           pin_memory=True, collate_fn=collate_fn)
+
+val_loader = DataLoader(val_dataset, batch_size=32,
+                        shuffle = False, num_workers = 4,
+                        pin_memory = True, collate_fn = collate_fn)
+
+# Quick test: Retrieve one batch from the training loader.
+images, targets = next(iter(train_loader))
+print("Batch Images Shape:", images.shape)
+print("Example Target:", targets[0])
+
+# Optionally, print the category mapping (id-to-name) if available.
+if train_dataset.id_to_category is not None:
+    print("Category Mapping:", train_dataset.id_to_category)
