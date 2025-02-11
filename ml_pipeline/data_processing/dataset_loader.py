@@ -15,7 +15,8 @@ from pathlib import Path
 import logging
 
 class UECFoodDataset(Dataset):
-    def __init__(self, root_dir:str, transform:Callable, image_ext:str):
+    def __init__(self, root_dir:str, transform:Callable, image_ext:str,
+                 nutrition_mapper=None):
         """
         Args:
             root_dir (str): Root directory containing subfolders for each food category.
@@ -25,6 +26,7 @@ class UECFoodDataset(Dataset):
         self.root_dir = Path(root_dir)
         self.transform = transform
         self.image_ext = image_ext
+        self.nutrition_mapper = nutrition_mapper
         self.data = []            # Each dict corresponds to one image
         self.id_to_category = {}  # Mapping numerical id to category name
         self._read_category_file()
@@ -128,7 +130,25 @@ class UECFoodDataset(Dataset):
 
         target = {"boxes":torch.tensor(yolo_boxes, dtype = torch.float32), # Shape: [num_boxes,4]
                   "labels":torch.tensor(labels, dtype = torch.int64)}  # Shape: [num_boxes]
+
+        # Portion estimation calculations
+        portion_data = {}
+        if self.nutrition_mapper:
+            food_name = self.id_to_category.get(item["label"], "unknown")
+            nutrition = self.nutrition_mapper.get_nutrition_data(food_name)
+
+            # Calculate area based portion estimation
+            bbox_area = (x2-x1)*(y2-y1)
+            portion =  self._estimate_portion(food_name, bbox_area)
+            target["portion"] = torch.tensor([portion], dtype = torch.float32)
+
         return image, target
+
+    def _estimate_portion(self, food_name:str, bbox_area:float):
+        """Estimate portion (volume in ml) using food-specific density per pixel area"""
+        density = self.nutrition_mapper.get_density(food_name) # g/pixel_area
+        return bbox_area * density
+
 
 # Define Augmentations
 # -------------------------
@@ -161,7 +181,8 @@ def collate_fn(batch):
         images.append(img)
         # Combine labels and boxes into [class_id, x, y, w, h]
         yolotarget = torch.cat([target["labels"].unsqueeze(1),
-                                target["boxes"]], dim = 1)
+                                target["boxes"],
+                                target.get("portion", torch.zeros(1).unsqueeze(1))], dim = 1)
         targets.append(yolotarget)
     images = torch.stack(images, dim = 0)
     return images, targets

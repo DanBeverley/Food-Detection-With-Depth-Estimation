@@ -16,6 +16,14 @@ class NutritionMapper:
         self.cache_file = cache_file
         self.base_url = "https://api.nal.usda.gov/fdc/v1/foods/search"
         self.cache = self._load_cache()
+        self.density_db = {
+            "rice":0.05,
+            "bread":0.03,
+            "meat":0.08 #TODO: Add more food type
+        }
+    def get_density(self, food_name:str)->float:
+        return self.density_db.get(food_name.lower(), 0.05)
+
     def _load_cache(self):
         """Load cache nutrition data from a CSV file, if available"""
         cache = {}
@@ -107,6 +115,7 @@ class NutritionMapper:
                      "carbohydrates":carbohydrates if carbohydrates is not None else 0}
            self.cache[key] = result
            self._save_cache_entry(food_label, result)
+           result["calories_per_ml"] = result["calories"]/100
            return result
         else:
             return None

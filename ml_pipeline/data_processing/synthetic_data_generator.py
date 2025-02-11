@@ -1,6 +1,7 @@
 import os
 import csv
 import torch
+import numpy as np
 import torch.nn as nn
 import torchvision
 from torch import optim
@@ -133,9 +134,10 @@ def compute_gradient_penalty(D:nn.Module, real_samples, fake_samples,
 
 class GANTrainer:
     def __init__(self, device:torch.device, nz:int=100, lr:float=0.0002,
-                 beta1:float=0.5):
+                 beta1:float=0.5, nutrition_mapper = None):
         self.device = device
         self.nz = nz
+        self.nutrition_mapper = nutrition_mapper
         self.netG = Generator(nz = nz).to(device=device)
         self.netD = Discriminator().to(device=device)
 
@@ -161,9 +163,16 @@ class GANTrainer:
     def _save_metadata(self, epoch:int, sample_filename:str):
         """Append metadata info for generated sample
            Add a placeholder for calories estimate (-1 indicates 'unknown')"""
+        # Generate realistic portion estimates based on food type
+        fake_label = "synthetic_food"
+        density = self.nutrition_mapper.get_density(fake_label)
+        bbox_area = np.random.randint(500,2000)
+        portion = bbox_area*density
+
         with open(self.metadata_file, "a", newline="") as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow([epoch, sample_filename, True, -1])
+            writer.writerow([epoch, sample_filename, True,
+                             portion*self.nutrition_mapper.calories_per_ml(fake_label)])
 
     def train(self, dataloader, epochs):
         lambda_gp = 10.0
@@ -205,7 +214,7 @@ class GANTrainer:
                 lossG.backward()
                 self.optimG.step()
 
-                progress_bar.set_postfix(loss_G=lossG.item(), loss_D=lossD.item())
+                progress_bar.set_postfix(loss_G=lossG.item(), loss_D=loss_D.item())
 
             self._save_samples(epoch)
             self._save_checkpoint(epoch)
