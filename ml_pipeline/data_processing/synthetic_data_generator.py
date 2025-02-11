@@ -1,11 +1,16 @@
 import os
+import csv
 import torch
 import torch.nn as nn
 import torchvision
 from torch import optim
+import torch.autograd as autograd
 from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import save_image
+from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
+from torch.cuda.amp import autocast, GradScaler
+from torch.nn.utils import spectral_norm
 from tqdm import tqdm
 from dataset_loader import UECFoodDataset
 
@@ -73,33 +78,65 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self, nc=3, ndf=64):
         super().__init__()
+        # self.main = nn.Sequential(
+        #     nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+        #     nn.LeakyReLU(0.2, inplace=True),
+        #     nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+        #     nn.BatchNorm2d(ndf * 2),
+        #     nn.LeakyReLU(0.2, inplace=True),
+        #     nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+        #     nn.BatchNorm2d(ndf * 4),
+        #     nn.LeakyReLU(0.2, inplace=True),
+        #     nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+        #     nn.BatchNorm2d(ndf * 8),
+        #     nn.LeakyReLU(0.2, inplace=True),
+        #     nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+        #     nn.Sigmoid()
+        # )
+        # Use spectral normalization for each conv layer for stability.
         self.main = nn.Sequential(
-            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+            spectral_norm(nn.Conv2d(nc, ndf, 4, 2, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            spectral_norm(nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ndf * 2),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            spectral_norm(nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ndf * 4),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            spectral_norm(nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ndf * 8),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
-            nn.Sigmoid()
+            spectral_norm(nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False)),
+            nn.Sigmoid()  # Even though WGAN-GP usually doesn't use Sigmoid, here we add gradient penalty on top of BCE.
         )
     def forward(self, x):
         return self.main(x).view(-1)
+# Gradient Penalty Function
+# ------------------
 
+def compute_gradient_penalty(D:nn.Module, real_samples, fake_samples,
+                             device:torch.cuda.device, lambda_gp:float=10.0):
+    batch_size = real_samples.size(0)
+    alpha = torch.rand(batch_size, 1, 1, 1, device = device)
+    interpolates = (alpha*real_samples + ((1-alpha)*fake_samples)).requires_grad_(True)
+    d_interpolates = D(interpolates)
+    ones = torch.ones(d_interpolates.size(), device = device)
+    gradients = autograd.grad(outputs = d_interpolates, inputs = interpolates,
+                              grad_outputs = ones, create_graph = True,
+                              retain_graph = True, only_inputs = True)[0]
+    gradients = gradients.view(batch_size, -1)
+    gradient_penalty = ((gradients.norm(2, dim=1)-1)**2).mean()
+    return gradient_penalty
 
-# Training Loop
+# Training Loop with Mixed Precision, Gradient Penalty and TensorBoard Logging
 # -------------------
 
 class GANTrainer:
     def __init__(self, device:torch.device, nz:int=100, lr:float=0.0002,
                  beta1:float=0.5):
         self.device = device
-        self.netG = Generator().to(device=device)
+        self.nz = nz
+        self.netG = Generator(nz = nz).to(device=device)
         self.netD = Discriminator().to(device=device)
 
         self.optimG = optim.Adam(self.netG.parameters(), lr=lr, betas=(beta1, 0.999))
@@ -110,7 +147,28 @@ class GANTrainer:
         self.sample_dir = "gan_samples"
         os.makedirs(self.sample_dir, exist_ok = True)
 
+        self.writer = SummaryWriter(log_dir="output/")
+
+        # Mixed precision scaler
+        self.scaler = GradScaler()
+
+        # Metadata file for estimation compatibility (CSV with header)
+        self.metadata_file = os.path.join(self.sample_dir, "metadata.csv")
+        if not os.path.exists(self.metadata_file):
+            with open(self.metadata_file, "w", newline="") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(["epoch", "sample_filename", "synthetic", "calories_estimate"])
+    def _save_metadata(self, epoch:int, sample_filename:str):
+        """Append metadata info for generated sample
+           Add a placeholder for calories estimate (-1 indicates 'unknown')"""
+        with open(self.metadata_file, "a", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([epoch, sample_filename, True, -1])
+
     def train(self, dataloader, epochs):
+        lambda_gp = 10.0
+
+        global_step = 0
         for epoch in range(epochs):
             progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
             for real_imgs in progress_bar:
@@ -118,23 +176,27 @@ class GANTrainer:
                 batch_size = real_imgs.size(0)
 
                 # Train Discriminator
-                self.netD.zero_grad()
                 real_labels = torch.ones(batch_size, device=self.device)
                 fake_labels = torch.zeros(batch_size, device=self.device)
 
-                # Real images
-                output_real = self.netD(real_imgs)
-                loss_real = self.criterion(output_real, real_labels)
+                self.netD.zero_grad()
+                with autocast():
+                    # Real images
+                    output_real = self.netD(real_imgs)
+                    loss_real = self.criterion(output_real, real_labels)
 
-                # Fake images
-                noise = torch.randn(batch_size, 100, 1, 1, device = self.device)
-                fakes = self.netG(noise)
-                output_fake = self.netD(fakes.detach())
-                loss_fake = self.criterion(output_fake, fake_labels)
+                    # Fake images
+                    noise = torch.randn(batch_size, self.fixed_noise.shape[1], 1, 1, device = self.device)
+                    fakes = self.netG(noise)
+                    output_fake = self.netD(fakes.detach())
+                    loss_fake = self.criterion(output_fake, fake_labels)
 
-                lossD = (loss_real+loss_fake)*.5
-                lossD.backward()
-                self.optimD.step()
+                    gp = compute_gradient_penalty(self.netD, real_imgs,
+                                                  fakes, self.device, lambda_gp)
+                    loss_D = (loss_real+loss_fake)*.5 + lambda_gp*gp
+                # Mixed Precision backward pass for discriminator
+                self.scaler.scale(loss_D).backward()
+                self.scaler.step(self.optimD)
 
                 # Train Generator
                 self.netG.zero_grad()
