@@ -21,7 +21,7 @@ from PIL import Image
 class FoodGANDataset(Dataset):
     def __init__(self, root_dir:str, transform:transforms=None, image_ext:str=".jpg"):
         self.root_dir = root_dir
-        self.transform = transform or transform.Compose([
+        self.transform = transform or transforms.Compose([
             transforms.Resize(128),
             transforms.CenterCrop(128),
             transforms.ToTensor(),

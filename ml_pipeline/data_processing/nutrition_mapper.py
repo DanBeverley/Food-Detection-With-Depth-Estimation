@@ -28,7 +28,7 @@ class NutritionMapper:
         """Load cache nutrition data from a CSV file, if available"""
         cache = {}
         if os.path.exists(self.cache_file):
-            with self.open(self.cache_file, "r", newline="", encoding="utf-8") as csvfile:
+            with open(self.cache_file, "r", newline="", encoding="utf-8") as csvfile:
                 reader = csv.DictReader(csvfile)
                 for row in reader:
                     label = row["label"]
@@ -70,7 +70,7 @@ class NutritionMapper:
         if response.status_code == 200:
             data = response.json()
             if "foods" in data and len(data["foods"])>0:
-                return data["food"][0]
+                return data["foods"][0]
             else:
                 return None
         else:

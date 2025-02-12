@@ -150,7 +150,7 @@ class HybridPortionEstimator:
     def _get_food_density(self, label):
         """Get density from database or nutrition mapper"""
         if self.nutrition_mapper:
-            nutrition = self.nutrition_mapper.map_food_label_to_nutrion(label)
+            nutrition = self.nutrition_mapper.map_food_label_to_nutrition(label)
             if nutrition and "density" in nutrition:
                 return nutrition["density"]
         return self.density_db.get(label.lower(), 0.8) # Default
@@ -158,7 +158,7 @@ class HybridPortionEstimator:
     def _estimate_calories(self, label, weight_g):
         # Estimate calories with nutrition mapper
         if self.nutrition_mapper:
-            nutrition = self.nutrition_mapper.map_food_label_to_nutrion(label)
+            nutrition = self.nutrition_mapper.map_food_label_to_nutrition(label)
             if nutrition and nutrition["calories_per_100g"]:
                 return (weight_g/100)*nutrition["calories_per_100g"]
         return weight_g*1.5 # Fallback 1.5 cal/g
@@ -172,7 +172,7 @@ class HybridPortionEstimator:
 
 class UECVolumeEstimator:
     def __init__(self, food_shape_priors = None):
-        self.food_shape_priors = food_shape_priors or self._get_default_shape
+        self.food_shape_priors = food_shape_priors or self._get_default_shape_prior
     def _get_default_shape_prior(self):
         """Define shape priors for common UEC-256 food categories
         Based on typical geometrical shapes of Japanese foods"""
@@ -329,7 +329,7 @@ class UECVolumeEstimator:
 
         return (mask_quality * 0.4 + depth_quality * 0.4 + shape_confidence * 0.2)
 
-    def _asses_mask_quality(self, mask):
+    def _assess_mask_quality(self, mask):
         """Assess quality of segmentation mask"""
         if not mask.any():
             return 0.0
