@@ -165,14 +165,19 @@ class GANTrainer:
            Add a placeholder for calories estimate (-1 indicates 'unknown')"""
         # Generate realistic portion estimates based on food type
         fake_label = "synthetic_food"
+        nutrition = self.nutrition_mapper.map_food_label_to_nutrition(fake_label)
+        # Get default values if no nutrition data
         density = self.nutrition_mapper.get_density(fake_label)
+        calories_per_ml = nutrition.get("calories_per_ml",
+                                        0.5) if nutrition else 0.5 # 0.5 cal/ml fallback
+
         bbox_area = np.random.randint(500,2000)
         portion = bbox_area*density
 
         with open(self.metadata_file, "a", newline="") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow([epoch, sample_filename, True,
-                             portion*self.nutrition_mapper.calories_per_ml(fake_label)])
+                             portion*calories_per_ml])
 
     def train(self, dataloader, epochs):
         lambda_gp = 10.0

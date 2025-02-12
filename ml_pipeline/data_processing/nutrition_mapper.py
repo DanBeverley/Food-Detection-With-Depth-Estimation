@@ -113,9 +113,11 @@ class NutritionMapper:
                      "protein":protein if protein is not None else 0,
                      "fat":fat if fat is not None else 0,
                      "carbohydrates":carbohydrates if carbohydrates is not None else 0}
+
+           density = self.get_density(food_label)
+           result["calories_per_ml"] = (result["calories"]/100)*density
            self.cache[key] = result
            self._save_cache_entry(food_label, result)
-           result["calories_per_ml"] = result["calories"]/100
            return result
         else:
             return None
