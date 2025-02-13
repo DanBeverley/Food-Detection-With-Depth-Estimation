@@ -1,5 +1,6 @@
 import os
 from typing import Callable
+from shape_mapping import UEC256ShapeMapper
 
 import cv2
 import numpy as np
@@ -27,6 +28,7 @@ class UECFoodDataset(Dataset):
         self.transform = transform
         self.image_ext = image_ext
         self.nutrition_mapper = nutrition_mapper
+        self.shape_mapper = UEC256ShapeMapper()
         self.data = []            # Each dict corresponds to one image
         self.id_to_category = {}  # Mapping numerical id to category name
         self._read_category_file()
@@ -146,8 +148,11 @@ class UECFoodDataset(Dataset):
 
     def _estimate_portion(self, food_name:str, bbox_area:float):
         """Estimate portion (volume in ml) using food-specific density per pixel area"""
-        density = self.nutrition_mapper.get_density(food_name) # g/pixel_area
-        return bbox_area * density
+        # density = self.nutrition_mapper.get_density(food_name) # g/pixel_area
+        shape_prior = self.shape_mapper.get_shape_prior(food_name)
+        # Example : Dome shape food volume = area^(3/2) * height_ratio
+        volume = (bbox_area**1.5)*shape_prior.height_ratio
+        return volume*shape_prior.volume_modifier
 
 
 # Define Augmentations

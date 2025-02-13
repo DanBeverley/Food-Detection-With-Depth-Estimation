@@ -372,7 +372,7 @@ class UnifiedFoodEstimator:
     def estimate(self, image, detections):
         """Unified estimation pipeline"""
         results = []
-
+        depth_map = self.hybrid_estimator._get_depth_map(image)
         for food in detections:
             # Get UEC-specific metadata
             category_id = food['label']
