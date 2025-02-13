@@ -9,7 +9,7 @@ import cv2
 
 class FoodDetector:
     def __init__(self, model_path:str=None, confidence:float=0.5, device:torch.device=None,
-                 half_precision:bool=True):
+                 half_precision:bool=True, **kwargs):
         """
        Initialize the food detector with YOLOv8
        Args:
@@ -42,6 +42,15 @@ class FoodDetector:
         if Path("yolo_scripted.pt").exists():
             self.scripted_model = torch.jit.load("yolo_scripted.pt")
 
+        self._export_torchscript()
+
+    def _export_torchscript(self):
+        if not Path("yolov8_scripted.pt").exists():
+            dummy_input = torch.randn(1,3,640,640).to(self.device)
+            if self.device.type == "cuda":
+                dummy_input = dummy_input.half()
+            self.scripted_model = torch.jit.trace(self.model, dummy_input)
+            torch.jit.save(self.scripted_model, "yolov8_scripted.pt")
     def optimize_for_mobile(self):
         quantized_model = torch.quantization.quantize_dynamic(self.model,
                                                               {torch.nn.Linear,

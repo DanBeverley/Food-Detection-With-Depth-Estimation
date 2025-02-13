@@ -34,6 +34,7 @@ class FoodClassifier:
                                                   map_location=self.device))
         # Quantization
         if quantized:
+            self._fuse_layers()
             self.model = quantize_dynamic(self.model.to("cpu"), # Dynamic quantization works best on CPU
                                           {torch.nn.Linear}, dtype = torch.qint8)
 
@@ -86,9 +87,18 @@ class FoodClassifier:
         return {"class_id":int(class_idx),
                 "confidence":float(prob)}
 
-    def fuse_model(self):
-        torch.quantization.fuse_modules(self.model, [['features.0.0', 'features.0.1']],
-                                        inplace = True)
+    def _fuse_layers(self):
+        """Fuse Conv+BN+ReLU layers for quantization compatibility"""
+        for module_name, module in self.model.named_children():
+            if "features" in module_name:
+                torch.quantization.fuse_modules(module, [["0.0","0.1","0.2"]], # Conv2d + BN + ReLU
+                                                inplace = True)
+    def calibrate(self, calibration_loader):
+        self.model.eval()
+        with torch.no_grad():
+            for images, _ in calibration_loader:
+                _ = self.model(images.to("cpu"))
+
 
     def train(self, train_loader, val_loader, epochs:int=100, learning_rate:float=0.001):
         """
