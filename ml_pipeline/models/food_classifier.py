@@ -1,14 +1,18 @@
 from pathlib import Path
+
+import cv2
 from PIL import Image
 import numpy as np
 
 import torch.cuda
 from torchvision import transforms
+from torch.quantization import quantize_dynamic
 
+from food_detector import FoodDetector
 
 class FoodClassifier:
     def __init__(self, model_path:str=None, num_classes:int=256,
-                 device:torch.device = None):
+                 device:torch.device = None, quantized:bool = None):
         """
         Initialize food classifier with MobileNetV3
         Args:
@@ -28,6 +32,11 @@ class FoodClassifier:
         if model_path and Path(model_path).exists():
             self.model.load_state_dict(torch.load(model_path,
                                                   map_location=self.device))
+        # Quantization
+        if quantized:
+            self.model = quantize_dynamic(self.model.to("cpu"), # Dynamic quantization works best on CPU
+                                          {torch.nn.Linear}, dtype = torch.qint8)
+
         self.model = self.model.to(device)
         self.model.eval()
 
@@ -39,13 +48,14 @@ class FoodClassifier:
                                                                   std = [0.229, 0.224, 0.225])])
     def preprocess_image(self, image):
         """Preprocess image for classification"""
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
-        elif isinstance(image, str):
-            image = Image.open(image)
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        return self.transform(image)
+        if isinstance(image, (str, Path)):
+            image = cv2.imread(str(image))
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        elif isinstance(image, np.ndarray):
+             if image.shape[2] == 3: # Ensure RGB
+                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        tensor = torch.from_numpy(image).permute(2,0,1).float()/255.0
+        return tensor.to(self.device)
 
     def classify_crop(self, image, bbox):
         """
@@ -75,6 +85,10 @@ class FoodClassifier:
 
         return {"class_id":int(class_idx),
                 "confidence":float(prob)}
+
+    def fuse_model(self):
+        torch.quantization.fuse_modules(self.model, [['features.0.0', 'features.0.1']],
+                                        inplace = True)
 
     def train(self, train_loader, val_loader, epochs:int=100, learning_rate:float=0.001):
         """
@@ -111,7 +125,8 @@ class FoodClassifier:
             correct = 0
             total = 0
 
-            with torch.no_grad():
+            # with torch.no_grad():
+            with torch.inference_mode():
                 for images, labels in val_loader:
                     images, labels = images.to(self.device), labels.to(self.device)
                     outputs = self.model(images)
@@ -134,4 +149,36 @@ class FoodClassifier:
             print(f"Epoch {epochs+1}/{epochs}: ")
             print(f"Train Loss: {train_loss/len(train_loader):.4f}")
             print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%")
+
+# For example usage
+# if __name__ == "__main__":
+#     # Initialize detector and classifier
+#     detector = FoodDetector(confidence=0.5)
+#     classifier = FoodClassifier(num_classes=256)
+#
+#     # Load and process an image
+#     image_path = "example_food.jpg"
+#     image = cv2.imread(image_path)
+#     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+#
+#     # Detect food items
+#     detections = detector.detect(image_rgb)
+#
+#     # Classify each detection
+#     results = []
+#     for det in detections:
+#         bbox = det['bbox']
+#         classification = classifier.classify_crop(image_rgb, bbox)
+#
+#         results.append({
+#             'bbox': bbox,
+#             'detection_conf': det['confidence'],
+#             'class_id': classification['class_id'],
+#             'classification_conf': classification['confidence']
+#         })
+#
+#     print(f"Found {len(results)} food items:")
+#     for r in results:
+#         print(f"Class {r['class_id']} at {r['bbox']} with confidence {r['classification_conf']:.2f}")
+
 

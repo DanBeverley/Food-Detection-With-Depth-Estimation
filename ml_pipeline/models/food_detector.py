@@ -8,7 +8,8 @@ import logging
 import cv2
 
 class FoodDetector:
-    def __init__(self, model_path:str=None, confidence:float=0.5, device:torch.device=None):
+    def __init__(self, model_path:str=None, confidence:float=0.5, device:torch.device=None,
+                 half_precision:bool=True):
         """
        Initialize the food detector with YOLOv8
        Args:
@@ -32,6 +33,22 @@ class FoodDetector:
 
         self.model.to(device)
 
+        # Half precision optimization
+        if half_precision and device.type == "cuda":
+            self.model = self.model.half()
+
+        # Export to TorchScript
+        self.scripted_model = None
+        if Path("yolo_scripted.pt").exists():
+            self.scripted_model = torch.jit.load("yolo_scripted.pt")
+
+    def optimize_for_mobile(self):
+        quantized_model = torch.quantization.quantize_dynamic(self.model,
+                                                              {torch.nn.Linear,
+                                                               torch.nn.Conv2d},
+                                                              dtype=torch.qint8)
+        torch.save(quantized_model.state_dict(), "yolo_quantized.pt")
+
     def preprocess_image(self, image):
         """Preprocess image for YOLO model"""
         if isinstance(image, str):
@@ -54,6 +71,10 @@ class FoodDetector:
         Returns:
             list of dict containing detection results
         """
+        if self.scripted_model:
+            results = self.scripted_model(image)
+        else:
+            results = self.model(image)
         image = self.preprocess_image(image)
 
         # Run inference
