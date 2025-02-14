@@ -76,7 +76,16 @@ class NutritionMapper:
         else:
             print(f"Error fetching nutrition data: {response.status_code}")
             return None
-
+    def get_default_nutrition(self):
+        """
+        Returns default nutrional data as a dictionary
+        Used as a fallback when no nutrion data is available
+        """
+        return {"calories":0,
+                "protein":0,
+                "fat":0,
+                "carbohydrates":0,
+                "calories_per_ml":.5}
     def map_food_label_to_nutrition(self, food_label:str):
         """
         Maps a food label to its nutrition data (calories, protein, fat, carbohydrates).

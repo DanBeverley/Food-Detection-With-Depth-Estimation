@@ -1,18 +1,50 @@
 from pathlib import Path
 
 import cv2
+
 from PIL import Image
 import numpy as np
 
+import torch.nn.functional as F
 import torch.cuda
+from torch.utils.data import ConcatDataset, DataLoader
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
 
 from food_detector import FoodDetector
+import matplotlib.pyplot as plt
+
+class ActiveLearner:
+    def __init__(self, initial_train_set, unlabeled_pool):
+        self.train_set = initial_train_set
+        self.unlabeled_pool = unlabeled_pool
+        self.labeled_food = []
+    def update_dataset(self, new_samples):
+        self.labeled_food.extend(new_samples)
+        self.train_set = ConcatDataset([self.train_set, new_samples])
+
+    def get_pool_loader(self, batch_size=64):
+        return DataLoader(self.unlabeled_pool, batch_size=batch_size)
+
+
+def display_image(img):
+    plt.figure(figsize=(8,8))
+    plt.imshow(img)
+    plt.axis("off")
+    plt.show()
+def human_labeling_interface(samples):
+    labeled = []
+    for img, pred in samples:
+        display_image(img)
+        true_label = input(f"Model Predicted {pred}. Enter correct label: ")
+        labeled.append((img, true_label))
+    return labeled
+
 
 class FoodClassifier:
     def __init__(self, model_path:str=None, num_classes:int=256,
-                 device:torch.device = None, quantized:bool = None):
+                 device:torch.device = None, quantized:bool = None,
+                 active_learner = None, **kwargs):
         """
         Initialize food classifier with MobileNetV3
         Args:
@@ -37,7 +69,8 @@ class FoodClassifier:
             self._fuse_layers()
             self.model = quantize_dynamic(self.model.to("cpu"), # Dynamic quantization works best on CPU
                                           {torch.nn.Linear}, dtype = torch.qint8)
-
+        self.active_learner = active_learner
+        self.unlabeled_pool = []
         self.model = self.model.to(device)
         self.model.eval()
 
@@ -47,6 +80,7 @@ class FoodClassifier:
                                              transforms.ToTensor(),
                                              transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                                                   std = [0.229, 0.224, 0.225])])
+
     def preprocess_image(self, image):
         """Preprocess image for classification"""
         if isinstance(image, (str, Path)):
@@ -98,6 +132,26 @@ class FoodClassifier:
         with torch.no_grad():
             for images, _ in calibration_loader:
                 _ = self.model(images.to("cpu"))
+    def get_uncertain_samples(self, pool_loader, top_k=100):
+        """Identify top-k most uncertain samples"""
+        uncertainties = []
+        with torch.inference_mode():
+            for images, _ in pool_loader:
+                outputs = self.model(images.to(self.device))
+                probs = F.softmax(outputs, dim=1)
+                uncertainties.extend((-probs*torch.log2(probs)).sum(dim=1).cpu().numpy()) # Entropy
+        indices = np.argsort(uncertainties)[-top_k:]
+        return [self.unlabeled_pool[i] for i in indices]
+
+    def active_learning_step(self, pool_loader, human_labeler):
+        # 1. Get uncertain samples
+        samples = self.get_uncertain_samples(pool_loader)
+        # 2. Human labeling
+        labeled_data = human_labeler(samples)
+        # 3. Update training set
+        self.active_learner.update_dataset(labeled_data)
+        # 4. Retrain
+        self.train(self.active_learner.train_laoder, self.active_learner.val_loader)
 
 
     def train(self, train_loader, val_loader, epochs:int=100, learning_rate:float=0.001):
@@ -109,7 +163,8 @@ class FoodClassifier:
             epochs: Number of training epochs
             learning_rate: Learning rate
         """
-        criterion = torch.nn.CrossEntropyLoss()
+        class_criterion = torch.nn.CrossEntropyLoss()
+        nutrition_criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
                                                                patience=5, factor=.5)
@@ -119,12 +174,19 @@ class FoodClassifier:
             """Training"""
             self.model.train()
             train_loss = 0
-            for images, labels in train_loader:
-                images, labels = images.to(self.device), labels.to(self.device)
+            for images, (labels, nutrition) in train_loader:
+
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                nutrition = nutrition.to(self.device)
 
                 optimizer.zero_grad()
                 outputs = self.model(images)
-                loss = criterion(outputs, labels)
+
+                # Combine Loss
+                loss = 0.7*class_criterion(outputs["class"], labels)+\
+                       0.3*nutrition_criterion(outputs["nutrition"],nutrition)
+
                 loss.backward()
                 optimizer.step()
 
@@ -140,7 +202,7 @@ class FoodClassifier:
                 for images, labels in val_loader:
                     images, labels = images.to(self.device), labels.to(self.device)
                     outputs = self.model(images)
-                    loss = criterion(outputs, labels)
+                    loss = class_criterion(outputs, labels)
 
                     val_loss += loss.item()
                     _, predicted = outputs.max(1)

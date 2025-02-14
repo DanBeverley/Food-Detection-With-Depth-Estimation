@@ -6,8 +6,8 @@ import torch.nn.functional as F
 from torchvision.ops import box_convert
 from PIL import Image
 from scipy.spatial import ConvexHull
-from dataset_loader import UECFoodDataset
-from nutrition_mapper import NutritionMapper
+
+from ml_pipeline.data_processing.shape_mapping import ShapePrior
 
 
 class HybridPortionEstimator:
@@ -35,6 +35,16 @@ class HybridPortionEstimator:
             self.midas_transform = torch.hub.load('intel-isl/MiDaS', 'transforms').small_transform
         except Exception as e:
             raise RuntimeError(f"Model loading failed: {e}")
+    def get_scale(self, image):
+        """
+        Compute the pixel-to-centimeter scale factor for an image.
+        This uses YOLOv8 to detect reference objects and then calculates
+        the scale based on a known width (e.g., a credit card is ~8.5 cm).
+        """
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        ref_objects = self._detect_reference_objects(img_rgb)
+        scale_ratio = self._calculate_scale(ref_objects, known_width_cm=8.5)
+        return scale_ratio
 
     def estimate_portion(self, image, food_boxes, food_labels):
         """
@@ -172,7 +182,7 @@ class HybridPortionEstimator:
 
 class UECVolumeEstimator:
     def __init__(self, food_shape_priors = None):
-        self.food_shape_priors = food_shape_priors or self._get_default_shape_prior
+        self.food_shape_priors = food_shape_priors or self._get_default_shape_prior()
     def _get_default_shape_prior(self):
         """Define shape priors for common UEC-256 food categories
         Based on typical geometrical shapes of Japanese foods"""
@@ -228,7 +238,7 @@ class UECVolumeEstimator:
         elif shape_prior['shape'] == 'cylinder':
             volume = self._estimate_cylinder_volume(depth_map, mask, area_cm2, shape_prior)
         else:  # irregular shape
-            volume = self._estimate_irregular_volume(depth_map, mask, area_cm2, shape_prior)
+            volume = self._estimate_irregular_volume(depth_map, mask, area_cm2, shape_prior, reference_scale)
         # Calculate confidence based on factors
         confidence = self._calculate_confidence(mask, depth_map, shape_prior)
 
@@ -272,8 +282,9 @@ class UECVolumeEstimator:
         height = 2*radius*prior["height_ratio"]
         return np.pi*(radius**2)*height
 
-    def _estimate_irregular_volume(self, depth_map, mask, area_cm2: float, prior,
-                                   pixel_scale) -> float:
+    def _estimate_irregular_volume(self, depth_map:np.ndarray, mask:np.ndarray,
+                                   area_cm2: float, prior:ShapePrior,
+                                   pixel_scale:float) -> float:
         """
         Estimate volume for irregularly shaped foods using depth integration.
 
@@ -296,7 +307,7 @@ class UECVolumeEstimator:
         scaled_depth = masked_depth * pixel_scale
 
         # Calculate volume by integrating depth values
-        # Since area_cm2 is already in cm², we multiply by scaled depth to get cm³
+        # Since area_cm2 is already in cm², multiply by scaled depth to get cm³
         pixel_area = np.sum(mask)  # Count of pixels in mask
         avg_depth_cm = np.sum(scaled_depth) / pixel_area if pixel_area > 0 else 0
         volume_cm3 = area_cm2 * avg_depth_cm
@@ -369,6 +380,31 @@ class UnifiedFoodEstimator:
         self.uec_estimator = UECVolumeEstimator()
         self.food_category_map = self._load_uec_categories()
 
+    def _load_uec_categories(self):
+        """
+        Loads category mapping from a file (e.g., 'category.txt')
+        If the file doesn't exist, a default mapping is used.
+        """
+        category_file = "/category.txt"
+        mapping = {}
+        if os.path.exists(category_file):
+            with open(category_file, "r") as f:
+                lines = f.readlines()
+                # Skip header
+                for line in lines[1:]:
+                    parts = line.strip().split()
+                    if len(parts)>=2:
+                        try:
+                            cat_id = int(parts[0])
+                            cat_name = " ".join(parts[1:])
+                            mapping[cat_id] = cat_name
+                        except ValueError:
+                            continue
+        else:
+            # Default mapping if file not found
+            mapping = {i:f"Category_{i}" for i in range(1,257)}
+        return mapping
+
     def estimate(self, image, detections):
         """Unified estimation pipeline"""
         results = []
@@ -387,12 +423,13 @@ class UnifiedFoodEstimator:
                     reference_scale=self.hybrid_estimator.get_scale(image)
                 )
             else:
-                # Fallback to hybrid method
+                # Fallback to hybrid method with a default confidence
                 volume = self.hybrid_estimator.estimate_portion(
                     image=image,
                     food_boxes=[food['bbox']],
                     food_labels=[food_class]
                 )[0]['volume']
+                confidence = 1.0
 
             # Add nutrition data from hybrid system
             nutrition = self.hybrid_estimator.nutrition_mapper.map_food_label_to_nutrition(food_class)

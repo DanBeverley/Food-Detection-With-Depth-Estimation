@@ -33,6 +33,14 @@ class UECFoodDataset(Dataset):
         self.id_to_category = {}  # Mapping numerical id to category name
         self._read_category_file()
         self._load_dataset()
+        self._validata_nutrition_data()
+
+    def _validate_nutrition_data(self):
+        if self.nutrition_mapper:
+            for cat_id in self.id_to_category.values():
+                nutrition = self.nutrition_mapper.get_nutrition_data(cat_id)
+                assert all(k in nutrition for k in ["calories", "protein", "fat", "carbohydrates"]),\
+                f"Missing nutrition data for {cat_id}"
 
     def _read_category_file(self):
         categories_file = os.path.join(self.root_dir, "category.txt")
@@ -134,17 +142,31 @@ class UECFoodDataset(Dataset):
                   "labels":torch.tensor(labels, dtype = torch.int64)}  # Shape: [num_boxes]
 
         # Portion estimation calculations
-        portion_data = {}
+        nutrition_data = torch.zeros(4, dtype=torch.float32) # [cal, prot, fat, carbs]
+
         if self.nutrition_mapper:
             food_name = self.id_to_category.get(item["label"], "unknown")
-            nutrition = self.nutrition_mapper.get_nutrition_data(food_name)
-
+            try:
+                nutrition = self.nutrition_mapper.get_nutrition_data(food_name)
+            except(KeyError, ConnectionError) as e:
+                logging.warning(f"Nutrition data unavailable for {food_name}: {e}")
+                nutrition = self.nutrition_mapper.get_default_nutrition()
+            nutrition_data = torch.tensor([nutrition.get("calories",0),
+                                           nutrition.get("protein",0),
+                                           nutrition.get("fat",0),
+                                           nutrition.get("carbohydrates",0)],
+                                          dtype=torch.float32)
             # Calculate area based portion estimation
             bbox_area = (x2-x1)*(y2-y1)
             portion =  self._estimate_portion(food_name, bbox_area)
-            target["portion"] = torch.tensor([portion], dtype = torch.float32)
+
+            target = {"boxes":torch.tensor(yolo_boxes, dtype=torch.float32),
+                      "labels":torch.tensor(labels, dtype=torch.int64),
+                      "portions":torch.tensor([portion], dtype=torch.float32),
+                      "nutrition":nutrition_data}
 
         return image, target
+
 
     def _estimate_portion(self, food_name:str, bbox_area:float):
         """Estimate portion (volume in ml) using food-specific density per pixel area"""
@@ -181,16 +203,19 @@ val_transform = A.Compose([A.Resize(height=224, width=224),
 # Custom Collate Function
 def collate_fn(batch):
     images = []
-    targets = []
+    detection_targets = []
+    nutrition_targets = []
     for img, target in batch:
         images.append(img)
         # Combine labels and boxes into [class_id, x, y, w, h]
         yolotarget = torch.cat([target["labels"].unsqueeze(1),
                                 target["boxes"],
                                 target.get("portion", torch.zeros(1).unsqueeze(1))], dim = 1)
-        targets.append(yolotarget)
+        detection_targets.append(yolotarget)
+        nutrition_targets.append(target["nutrition"])
     images = torch.stack(images, dim = 0)
-    return images, targets
+    return (images, {"detection":detection_targets,
+                     "nutrition":torch.stack(nutrition_targets,0)})
 
 
 # Creating DataLoaders
