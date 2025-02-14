@@ -17,9 +17,45 @@ class NutritionMapper:
         self.base_url = "https://api.nal.usda.gov/fdc/v1/foods/search"
         self.cache = self._load_cache()
         self.density_db = {
-            "rice":0.05,
-            "bread":0.03,
-            "meat":0.08 #TODO: Add more food type
+            "rice": 0.05,
+            "white rice": 0.05,
+            "brown rice": 0.05,
+            "bread": 0.03,
+            "whole wheat bread": 0.03,
+            "meat": 0.08,
+            "chicken": 0.08,
+            "beef": 0.09,
+            "pork": 0.08,
+            "fish": 0.08,
+            "pasta": 0.06,
+            "potato": 0.07,
+            "vegetables": 0.04,
+            "broccoli": 0.04,
+            "carrot": 0.04,
+            "salad": 0.02,
+            "fruit": 0.04,
+            "apple": 0.04,
+            "banana": 0.04,
+            "orange": 0.04,
+            "cereal": 0.03,
+            "oatmeal": 0.05,
+            "soup": 0.09,
+            "stew": 0.09,
+            "cheese": 0.1,
+            "egg": 0.09,
+            "burger": 0.12,
+            "pizza": 0.1,
+            "taco": 0.07,
+            "pancakes": 0.04,
+            "waffles": 0.04,
+            "cookies": 0.03,
+            "brownie": 0.03,
+            "cake": 0.03,
+            "pie": 0.03,
+            "yogurt": 0.05,
+            "ice cream": 0.06,
+            "almonds": 0.07,
+            "peanuts": 0.07
         }
     def get_density(self, food_name:str)->float:
         return self.density_db.get(food_name.lower(), 0.05)

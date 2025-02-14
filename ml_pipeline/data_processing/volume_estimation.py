@@ -7,7 +7,7 @@ from torchvision.ops import box_convert
 from PIL import Image
 from scipy.spatial import ConvexHull
 
-from ml_pipeline.data_processing.shape_mapping import ShapePrior
+from shape_mapping import ShapePrior
 
 
 class HybridPortionEstimator:

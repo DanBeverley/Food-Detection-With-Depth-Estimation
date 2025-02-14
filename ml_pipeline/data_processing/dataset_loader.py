@@ -33,7 +33,7 @@ class UECFoodDataset(Dataset):
         self.id_to_category = {}  # Mapping numerical id to category name
         self._read_category_file()
         self._load_dataset()
-        self._validata_nutrition_data()
+        self._validate_nutrition_data()
 
     def _validate_nutrition_data(self):
         if self.nutrition_mapper:
