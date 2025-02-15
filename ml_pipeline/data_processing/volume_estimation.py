@@ -46,7 +46,16 @@ class HybridPortionEstimator:
         scale_ratio = self._calculate_scale(ref_objects, known_width_cm=8.5)
         return scale_ratio
 
-    def estimate_portion(self, image, food_boxes, food_labels):
+    def _get_region_depth(self, depth_map, mask):
+        """Get average depth in masked region"""
+        if mask is not None:
+            valid_depths = depth_map[mask]
+        else:  # Fallback to bounding box
+            x1, y1, x2, y2 = map(int, box)
+            valid_depths = depth_map[y1:y2,x1:x2].flatten()
+        return np.mean(valid_depths) if valid_depths.size>0 else .1
+
+    def estimate_portion(self, image, food_boxes, food_labels, masks=None):
         """
         Hybrid estimation pipeline:
         1. Reference scale detection
@@ -67,7 +76,16 @@ class HybridPortionEstimator:
         depth_map = self._get_depth_map(img_rgb)
 
         portions = []
-        for box, label in zip(food_boxes, food_labels):
+        for idx,(box, label) in enumerate(zip(food_boxes, food_labels)):
+            if masks and idx<len(masks):
+                mask_area = np.sum(masks[idx])
+                area_cm2 = mask_area*(scale_ratio**2)
+            else:
+                # Fallback to bbox area
+                w = box[2]-box[0]
+                h = box[3]-box[1]
+                area_cm2 = (w*h)*(scale_ratio**2)
+
             # Convert to xywh format
             x, y, w, h = box_convert(box, 'xyxy', 'xywh').tolist()
 

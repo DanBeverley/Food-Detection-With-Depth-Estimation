@@ -7,24 +7,26 @@ import numpy as np
 
 import torch.nn.functional as F
 import torch.cuda
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
+from torchvision.datasets import ImageFolder
 
 from food_detector import FoodDetector
 import matplotlib.pyplot as plt
 
 class ActiveLearner:
-    def __init__(self, initial_train_set, unlabeled_pool):
-        self.train_set = initial_train_set
-        self.unlabeled_pool = unlabeled_pool
-        self.labeled_food = []
+    def __init__(self, base_dataset, unlabeled_pool):
+        self.base_dataset = base_dataset
+        self.unlabeled_pool = ImageFolder(unlabeled_pool, transform=base_dataset.transform)
+        self.labeled_food = set()
     def update_dataset(self, new_samples):
-        self.labeled_food.extend(new_samples)
-        self.train_set = ConcatDataset([self.train_set, new_samples])
+        self.labeled_food.update(new_samples)
+        self.current_dataset = ConcatDataset([self.base_dataset,
+                                              Subset(self.unlabeled_pool, list(self.labeled_food))])
 
-    def get_pool_loader(self, batch_size=64):
-        return DataLoader(self.unlabeled_pool, batch_size=batch_size)
+    # def get_pool_loader(self, batch_size=64):
+    #     return DataLoader(self.unlabeled_pool, batch_size=batch_size)
 
 
 def display_image(img):
@@ -44,7 +46,7 @@ def human_labeling_interface(samples):
 class FoodClassifier:
     def __init__(self, model_path:str=None, num_classes:int=256,
                  device:torch.device = None, quantized:bool = None,
-                 active_learner = None, **kwargs):
+                 active_learner = None, label_smoothing=0.1,  **kwargs):
         """
         Initialize food classifier with MobileNetV3
         Args:
@@ -68,9 +70,10 @@ class FoodClassifier:
         if quantized:
             self._fuse_layers()
             self.model = quantize_dynamic(self.model.to("cpu"), # Dynamic quantization works best on CPU
-                                          {torch.nn.Linear}, dtype = torch.qint8)
+                                          {torch.nn.Linear, torch.nn.Conv2d}, dtype = torch.qint8)
         self.active_learner = active_learner
         self.unlabeled_pool = []
+        self.label_smoothing = label_smoothing
         self.model = self.model.to(device)
         self.model.eval()
 
@@ -83,13 +86,29 @@ class FoodClassifier:
 
     def preprocess_image(self, image):
         """Preprocess image for classification"""
+        # Handle path input
         if isinstance(image, (str, Path)):
             image = cv2.imread(str(image))
+            if image is None:
+                raise ValueError(f"Could not read image from {image}")
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # Validate numpy array input
         elif isinstance(image, np.ndarray):
-             if image.shape[2] == 3: # Ensure RGB
-                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        tensor = torch.from_numpy(image).permute(2,0,1).float()/255.0
+             if image.ndim != 3 or image.shape[2] != 3:
+                 raise ValueError(f"Invalid image shape: {image.shape}"
+                                  "Expected (H, W, 3) RGB array")
+             if image.dtype != np.uint8:
+                 raise ValueError(f"Invalid dtype: {image.shape}"
+                                  "Expected uint8 (0-255 range)")
+        else:
+            raise TypeError("Input must be path string or numpy array")
+        # Convert to tensor with explicit channel dimension
+        tensor = torch.from_numpy(image).permute(2,0,1).float()/255.0 # CxHxW
+        if tensor.shape[0]!=3:
+            raise ValueError(
+                f"Invalid channel dimension: {tensor.shape[0]}"
+                "Expected 3-channel RGB image"
+            )
         return tensor.to(self.device)
 
     def classify_crop(self, image, bbox):
@@ -151,7 +170,7 @@ class FoodClassifier:
         # 3. Update training set
         self.active_learner.update_dataset(labeled_data)
         # 4. Retrain
-        self.train(self.active_learner.train_laoder, self.active_learner.val_loader)
+        self.train(self.active_learner.train_loader, self.active_learner.val_loader)
 
 
     def train(self, train_loader, val_loader, epochs:int=100, learning_rate:float=0.001):
@@ -163,7 +182,13 @@ class FoodClassifier:
             epochs: Number of training epochs
             learning_rate: Learning rate
         """
-        class_criterion = torch.nn.CrossEntropyLoss()
+        from torch.utils.checkpoint import checkpoint
+        def custom_forward(x):
+            return self.model(x)
+        if self.active_learner:
+            train_loader = DataLoader(self.active_learner.current_dataset,
+                                      batch_size = 32, shuffle=True)
+        class_criterion = torch.nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
         nutrition_criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
@@ -181,12 +206,11 @@ class FoodClassifier:
                 nutrition = nutrition.to(self.device)
 
                 optimizer.zero_grad()
-                outputs = self.model(images)
-
-                # Combine Loss
-                loss = 0.7*class_criterion(outputs["class"], labels)+\
-                       0.3*nutrition_criterion(outputs["nutrition"],nutrition)
-
+                with torch.cuda.amp.autocast():
+                    outputs = checkpoint(custom_forward, images)
+                    # Combine Loss
+                    loss = 0.7*class_criterion(outputs["class"], labels)+\
+                           0.3*nutrition_criterion(outputs["nutrition"],nutrition)
                 loss.backward()
                 optimizer.step()
 

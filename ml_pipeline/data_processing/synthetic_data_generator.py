@@ -1,5 +1,9 @@
 import os
 import csv
+from pathlib import Path
+from typing import Callable
+
+import cv2
 import torch
 import numpy as np
 import torch.nn as nn
@@ -7,25 +11,35 @@ import torchvision
 from torch import optim
 import torch.autograd as autograd
 from torch.utils.data import DataLoader, Dataset
-from torchvision.utils import save_image
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from torch.cuda.amp import autocast, GradScaler
 from torch.nn.utils import spectral_norm
-from tqdm import tqdm
-from dataset_loader import UECFoodDataset
+import albumentations as A
+
 
 from tqdm import tqdm
 from PIL import Image
 
 class FoodGANDataset(Dataset):
-    def __init__(self, root_dir:str, transform:transforms=None, image_ext:str=".jpg"):
-        self.root_dir = root_dir
-        self.transform = transform or transforms.Compose([
-            transforms.Resize(128),
-            transforms.CenterCrop(128),
-            transforms.ToTensor(),
-            transforms.Normalize((.5,.5,.5), (.5,.5,.5))
+    def __init__(self, root_dir:str,image_dir:str,
+                 mask_dir:str, transform:Callable=None, image_ext:str=".jpg"):
+        self.root_dir = Path(root_dir)
+        # self.transform = transform or transforms.Compose([
+        #     transforms.Resize(128),
+        #     transforms.CenterCrop(128),
+        #     transforms.ToTensor(),
+        #     transforms.Normalize((.5,.5,.5), (.5,.5,.5))
+        # ])
+        self.image_paths = list((self.root_dir / image_dir).glob("*.jpg"))
+        self.mask_paths = list((self.root_dir / mask_dir).glob("*.png"))
+        self.transform = transform or A.Compose([
+            A.Compose([
+                A.HorizontalFlip(p=0.5),
+                A.Rotate(limit=30),
+                A.RandomBrightnessContrast(p=0.2),
+                A.GridDistortion(p=0.3)
+            ], additional_targets={"mask":"mask"})
         ])
         self.image_paths = []
 
@@ -37,8 +51,14 @@ class FoodGANDataset(Dataset):
     def __len__(self):
         return len(self.image_paths)
     def __getitem__(self, idx:int):
-        img = Image.open(self.image_paths[idx]).convert("RGB")
-        return self.transform(img)
+        image = cv2.imread(str(self.image_paths[idx]))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(str(self.mask_paths[idx]), cv2.IMREAD_GRAYSCALE)
+
+        transformed = self.transform(image=image, mask=mask)
+        return transformed['image'], transformed['mask']
+    def load_item(self, idx):
+        return self.__getitem__(idx)
 
 # GAN Architecture
 # ----------------------
@@ -112,6 +132,7 @@ class Discriminator(nn.Module):
         )
     def forward(self, x):
         return self.main(x).view(-1)
+
 # Gradient Penalty Function
 # ------------------
 

@@ -1,15 +1,14 @@
 import torch
 import numpy as np
+from torch.ao.quantization import quantize_dynamic
 from ultralytics import YOLO
-from PIL import Image
-import torchvision.transforms as transforms
 from pathlib import Path
 import logging
 import cv2
 
 class FoodDetector:
     def __init__(self, model_path:str=None, confidence:float=0.5, device:torch.device=None,
-                 half_precision:bool=True, **kwargs):
+                 half_precision:bool=True, quantized:bool=None,  **kwargs):
         """
        Initialize the food detector with YOLOv8
        Args:
@@ -32,7 +31,12 @@ class FoodDetector:
             raise
 
         self.model.to(device)
-
+        # Quantization
+        if quantized:
+            self._fuse_layers()
+            self.model = quantize_dynamic(self.model.to("cpu"),{torch.nn.Conv2d,
+                                                                torch.nn.Linear},
+                                          dtype = torch.qint8)
         # Half precision optimization
         if half_precision and device.type == "cuda":
             self.model = self.model.half()
@@ -43,7 +47,12 @@ class FoodDetector:
             self.scripted_model = torch.jit.load("yolo_scripted.pt")
 
         self._export_torchscript()
-
+    def _fuse_layers(self):
+        """Fuse Conv+BN+ReLU layers for quantization compatibility"""
+        for module_name, module in self.model.named_children():
+            if "features" in module_name:
+                torch.quantization.fuse_modules(module, [["0.0","0.1","0.2"]], # Conv2d + BN + ReLU
+                                                inplace = True)
     def _export_torchscript(self):
         if not Path("yolov8_scripted.pt").exists():
             dummy_input = torch.randn(1,3,640,640).to(self.device)
@@ -73,7 +82,7 @@ class FoodDetector:
 
     def detect(self, image, return_masks=False):
         """
-        Detect food items in image
+        Detect food items in image with optional segmentation masks
         Args:
             image: numpy array or path to image
             return_masks: whether to return segmentation masks
@@ -92,15 +101,31 @@ class FoodDetector:
         # Process results
         detections = []
         for result in results:
-            boxes = result.boxes
-            for i in range(len(boxes)):
-                detection = {"bbox":boxes.xyxy[i].cpu().numpy(), #x1, y1, x2, y2
-                             "confidence": float(boxes.conf[i]),
-                             "class_id":int(boxes.cls[i])}
-                if return_masks and hasattr(result, "mask"):
-                    detection["mask"] = result.masks[i].cpu().numpy()
+            boxes = result.boxes.xyxy.cpu().numpy()
+            # Masks if available
+            masks = result.masks if hasattr(result, "mask") else None
+
+            for i, box in enumerate(boxes):
+                detection = {"bbox":box,
+                             "confidence": float(result.boxes.conf[i]),
+                             "class_id":int(result.boxes.cls[i])}
+                if return_masks and masks:
+                    # Convert mask to original image dimensions
+                    mask = masks[i].data.cpu().numpy().squeeze()
+                    orig_h, orig_w = image.shape[:2]
+                    # Resize mask to match original image size
+                    mask = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                    detection["mask"] = mask.astype(bool)
                 detections.append(detection)
         return detections
+    def _postprocess_mask(self, mask, threshold=.5):
+        """Apply morphological operations to clean mask"""
+        # Binarize mask
+        _, binary_mask = cv2.threshold(mask, threshold, 1, cv2.THRESH_BINARY)
+        # Morphological closing to fill holes
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+        processed_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        return processed_mask
 
     def train(self, data_yaml:str, epochs:int = 100, batch_size:int=16,
               image_size:int=640):
@@ -115,7 +140,7 @@ class FoodDetector:
         try:
             self.model.train(data=data_yaml,
                              epochs=epochs,
-                             bactch_size=batch_size,
+                             batch_size=batch_size,
                              imgsz=image_size,
                              device=self.device)
         except Exception as e:

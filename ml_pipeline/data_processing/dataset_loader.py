@@ -9,6 +9,8 @@ from collections import defaultdict
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+import asyncio
+from typing import Dict, Any
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -34,13 +36,46 @@ class UECFoodDataset(Dataset):
         self._read_category_file()
         self._load_dataset()
         self._validate_nutrition_data()
+        self.nutrition_cache: Dict[str, Dict[str, float]] = {}  # {category_name: nutrition_data}
+
+    async def initialize(self):
+        """Async initialization hook"""
+        if self.nutrition_mapper:
+            await self._load_nutrition_data()
+            self._validate_nutrition_data()
+
+    async def _load_nutrition_data(self):
+        """Async nutrition data loading with parallel requests"""
+        if not self.nutrition_mapper:
+            return
+        # Create tasks for all categories
+        tasks = []
+        category_names = list(self.id_to_category.values())
+
+        for cat_name in category_names:
+            tasks.append(self.nutrition_mapper.map_food_label_to_nutrition(cat_name))
+        # Run all requests in parallel
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        for cat_name, result in zip(category_names, results):
+            if isinstance(result, Exception):
+                logging.warning(f"Failed to load nutrition for {cat_name}: {str(result)}")
+                self.nutrition_cache[cat_name] = self.nutrition_mapper.get_default_nutrition()
+            else:
+                self.nutrition_cache[cat_name] = result
 
     def _validate_nutrition_data(self):
+        """Validate cached nutrition data"""
         if self.nutrition_mapper:
             for cat_id in self.id_to_category.values():
                 nutrition = self.nutrition_mapper.get_nutrition_data(cat_id)
-                assert all(k in nutrition for k in ["calories", "protein", "fat", "carbohydrates"]),\
-                f"Missing nutrition data for {cat_id}"
+                if not nutrition:
+                    raise ValueError(f"Missing nutrition data for {cat_id}")
+
+                required_keys = ["calories", "protein", "fat", "carbohydrates"]
+                if not all(k in nutrition for k in required_keys):
+                    raise ValueError(f"Incomplete nutrition data for {cat_id}")
 
     def _read_category_file(self):
         categories_file = os.path.join(self.root_dir, "category.txt")
@@ -147,7 +182,9 @@ class UECFoodDataset(Dataset):
         if self.nutrition_mapper:
             food_name = self.id_to_category.get(item["label"], "unknown")
             try:
-                nutrition = self.nutrition_mapper.get_nutrition_data(food_name)
+                # nutrition = self.nutrition_mapper.get_nutrition_data(food_name)
+                nutrition = self.nutrition_cache.get(food_name,
+                                                     self.nutrition_mapper.get_default_nutrition())
             except(KeyError, ConnectionError) as e:
                 logging.warning(f"Nutrition data unavailable for {food_name}: {e}")
                 nutrition = self.nutrition_mapper.get_default_nutrition()
@@ -156,14 +193,18 @@ class UECFoodDataset(Dataset):
                                            nutrition.get("fat",0),
                                            nutrition.get("carbohydrates",0)],
                                           dtype=torch.float32)
-            # Calculate area based portion estimation
-            bbox_area = (x2-x1)*(y2-y1)
-            portion =  self._estimate_portion(food_name, bbox_area)
+            if 'mask' in item:
+                mask_area = np.sum(item["mask"])
+                portion = self._estimate_portion(food_name, mask_area)
+            else:   # Fallback to bbox area
+                # Calculate area based portion estimation
+                bbox_area = (x2-x1)*(y2-y1)
+                portion =  self._estimate_portion(food_name, bbox_area)
 
-            target = {"boxes":torch.tensor(yolo_boxes, dtype=torch.float32),
-                      "labels":torch.tensor(labels, dtype=torch.int64),
-                      "portions":torch.tensor([portion], dtype=torch.float32),
-                      "nutrition":nutrition_data}
+                target = {"boxes":torch.tensor(yolo_boxes, dtype=torch.float32),
+                          "labels":torch.tensor(labels, dtype=torch.int64),
+                          "portions":torch.tensor([portion], dtype=torch.float32),
+                          "nutrition":nutrition_data}
 
         return image, target
 
