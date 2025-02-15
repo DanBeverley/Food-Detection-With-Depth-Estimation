@@ -58,7 +58,8 @@ class FoodDetector:
             dummy_input = torch.randn(1,3,640,640).to(self.device)
             if self.device.type == "cuda":
                 dummy_input = dummy_input.half()
-            self.scripted_model = torch.jit.trace(self.model, dummy_input)
+            self.model.export(format="torchscript", imgsz=640, optimizer=True)
+            self.scripted_model = torch.jit.load("yolov8.torchscript")
             torch.jit.save(self.scripted_model, "yolov8_scripted.pt")
     def optimize_for_mobile(self):
         quantized_model = torch.quantization.quantize_dynamic(self.model,
@@ -90,6 +91,8 @@ class FoodDetector:
             list of dict containing detection results
         """
         if self.scripted_model:
+            if self.device.type == "cuda":
+                image = image.half() # Convert to FP16
             results = self.scripted_model(image)
         else:
             results = self.model(image)
@@ -103,7 +106,7 @@ class FoodDetector:
         for result in results:
             boxes = result.boxes.xyxy.cpu().numpy()
             # Masks if available
-            masks = result.masks if hasattr(result, "mask") else None
+            masks = result.masks if hasattr(result, "masks") else None
 
             for i, box in enumerate(boxes):
                 detection = {"bbox":box,
@@ -115,7 +118,7 @@ class FoodDetector:
                     orig_h, orig_w = image.shape[:2]
                     # Resize mask to match original image size
                     mask = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-                    detection["mask"] = mask.astype(bool)
+                    detection["mask"] = mask.astype(np.float32)
                 detections.append(detection)
         return detections
     def _postprocess_mask(self, mask, threshold=.5):

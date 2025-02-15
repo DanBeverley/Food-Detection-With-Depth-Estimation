@@ -148,6 +148,15 @@ class UECFoodDataset(Dataset):
         return len(self.data)
     def __getitem__(self, idx):
         item = self.data[idx]
+
+        # Mask loading verification
+        mask_path = Path(item["image_path"]).with_suffix(".png")
+        mask = None
+        if mask_path.exists():
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            mask = (mask>127).astype(np.float32) # Convert to binary float mask
+            item["mask"] = mask
+
         # Load the image using OpenCV and convert BGR to RGB
         image = cv2.imread(item["image_path"])
         if image is None:
@@ -205,6 +214,13 @@ class UECFoodDataset(Dataset):
                           "labels":torch.tensor(labels, dtype=torch.int64),
                           "portions":torch.tensor([portion], dtype=torch.float32),
                           "nutrition":nutrition_data}
+        if "mask" in item:
+            transformed = self.transform(image=image, bboxes=bboxes, labels=labels,
+                                         mask=item["mask"])
+            mask = transformed["mask"]
+        else:
+            transformed = self.transform(image=image, bboxes=bboxes, labels=labels)
+        target["mask"] = mask if mask is not None else torch.zeros(1)
 
         return image, target
 
