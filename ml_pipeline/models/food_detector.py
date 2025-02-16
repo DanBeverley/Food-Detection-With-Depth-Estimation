@@ -127,6 +127,17 @@ class FoodDetector:
             else:
                 self.outputs.append({"host":host_mem, "device":device_mem})
 
+    def _preprocess(self, image):
+        """Preprocess image for TensorRT inference"""
+        # Resize and Normalize
+        img = cv2.resize(image, self.input_shape[1:][::-1])
+        img = img.transpose(2,0,1) # HWC to CHW
+        img = np.ascontiguousarray(img).astype(np.float32)/255.0
+        # Expand dimension if needed
+        if len(img.shape)==3:
+            img = np.expand_dims(img, axis=0)
+        return img
+
     def detect(self, image, return_masks=False):
         """
         Detect food items in image with optional segmentation masks
@@ -168,6 +179,105 @@ class FoodDetector:
                     detection["mask"] = mask.astype(np.float32)
                 detections.append(detection)
         return detections
+
+    def detect_TRT(self, image):
+        """Run inference using TensorRT engine"""
+        if not self.trt_engine:
+            raise RuntimeError("TensorRT engine not initialized!")
+
+        # Preprocess input
+        preprocessed = self._preprocess(image)
+        np.copyto(self.inputs[0]['host'], preprocessed.ravel())
+
+        # Transfer data to GPU
+        cuda.memcpy_htod_async(
+            self.inputs[0]['device'],
+            self.inputs[0]['host'],
+            self.stream
+        )
+
+        # Run inference
+        self.context.execute_async_v2(
+            bindings=self.bindings,
+            stream_handle=self.stream.handle
+        )
+
+        # Transfer predictions back
+        cuda.memcpy_dtoh_async(
+            self.outputs[0]['host'],
+            self.outputs[0]['device'],
+            self.stream
+        )
+        self.stream.synchronize()
+
+        # Post-process outputs
+        output = self.outputs[0]['host']
+        return self._postprocess(output, image.shape)
+
+    def _postprocess(self, output, orig_shape):
+        """Convert raw TensorRT output to YOLO results format"""
+        # Reshape output
+        num_detections = int(output[0])
+        boxes = output[1:1 + num_detections * 4].reshape(-1, 4)
+        scores = output[1 + num_detections * 4:1 + num_detections * 5]
+        class_ids = output[1 + num_detections * 5:1 + num_detections * 6].astype(int)
+
+        # Scale boxes to original image size
+        boxes = self._scale_boxes(boxes, orig_shape)
+
+        # Convert to list of detections
+        detections = []
+        for i in range(num_detections):
+            detections.append({
+                'bbox': boxes[i],
+                'confidence': float(scores[i]),
+                'class_id': int(class_ids[i])
+            })
+
+        return detections
+
+    def _scale_boxes(self, boxes, orig_shape):
+        """Rescale boxes from input size to original image size"""
+        input_height, input_width = self.input_shape[1:]
+        orig_height, orig_width = orig_shape[:2]
+
+        # Calculate scaling factors
+        gain = min(input_height / orig_height, input_width / orig_width)
+        pad_x = (input_width - orig_width * gain) / 2
+        pad_y = (input_height - orig_height * gain) / 2
+
+        # Scale boxes
+        boxes[:, [0, 2]] -= pad_x
+        boxes[:, [1, 3]] -= pad_y
+        boxes[:, :4] /= gain
+
+        # Clip boxes to image boundaries
+        boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, orig_width)
+        boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, orig_height)
+
+        return boxes
+
+    def warmup(self, iterations=10):
+        """Warmup TensorRT engine for stable performance"""
+        dummy_input = np.random.randn(*self.input_shape).astype(np.float32)
+        for _ in range(iterations):
+            self.detect(dummy_input)
+
+    def prepare_for_qat(self):
+        """Modify model for quantization-aware training"""
+        from pytorch_quantization import quant_modules
+        quant_modules.initialize()
+
+        # Replace layers with quantized versions
+        self.model = quant_modules.quantize_model(self.model)
+
+    def calibrate_model(self, calib_loader):
+        """Run calibration for INT8 quantization"""
+        self.model.eval()
+        with torch.no_grad():
+            for images, _ in calib_loader:
+                self.model(images.to(self.device))
+
     def _postprocess_mask(self, mask, threshold=.5):
         """Apply morphological operations to clean mask"""
         # Binarize mask

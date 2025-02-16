@@ -14,6 +14,7 @@ class FoodTrainingSystem:
     def __init__(self, config):
         self.config = config
         self.device = torch.device(config["device"])
+        self.trt_engine_path = config.get("trt_engine_path", "models/yolov8.trt")
         # Initialize components
         self.nutrition_mapper = NutritionMapper(api_key=config["usda_key"])
         self.dataset = UECFoodDataset(root_dir=config["data_root"],
@@ -46,13 +47,14 @@ class FoodTrainingSystem:
 
     async def train_epoch(self, epoch):
         self.classifier.model.train()
-        self.detector.model.train()
         total_loss = 0
         for batch_idx, (images, targets) in enumerate(self.train_loader):
             images = images.to(self.device, non_blocking=True)
             # Mixed precision training
-            with autocast():
-                # Detection
+            if self.config["qat_enabled"] and epoch == self.config["qat_start_epoch"]:
+                self.detector.prepare_for_qat()
+                self.detector.calibrate_model(calib_loader)
+            with autocast(enabled = self.config["mixed_precision"]):
                 detections = self.detector.detect(images, return_masks=True)
                 # Classification and Nutrition
                 class_outputs = self.classifier.model(images)
@@ -99,6 +101,8 @@ class FoodTrainingSystem:
             # Quantize after 5 epochs
             if epoch == 5 and self.config["quantize"]:
                 self._quantize_models()
+            if epoch%10 == 0:
+                self._export_trt_checkpoint(epoch)
 
     def validate(self):
         self.classifier.model.eval()
@@ -117,7 +121,11 @@ class FoodTrainingSystem:
                       "detector":self.detector.model.state_dict(),
                       "optimizer":self.optimizer.state_dict(),
                       "epoch":epoch,
-                      "losses":(train_loss, val_loss)}
+                      "losses":(train_loss, val_loss),
+                      "trt_compatibility": "fp16" if self.config["fp16"] else "fp32",
+                      "input_shape": self.detector.input_shape,
+                      "calibration_data": self.config["trt_calibration_data"]
+                      }
         torch.save(checkpoint, f"checkpoints/{timestamp}_epoch{epoch}.pt")
 
     def _quantize_models(self):
@@ -127,8 +135,55 @@ class FoodTrainingSystem:
         if self.device.type == "cuda":
             self.detector.build_trt_engine()
 
+    def _export_trt_checkpoint(self, epoch):
+        """Export best model to TensorRT format"""
+        # Load best weights
+        self.detector.model = YOLO(f"checkpoints/best_epoch{epoch}.pt")
+
+        # Export to TensorRT
+        self.detector.build_trt_engine(output_path=self.trt_engine_path)
+
+        # Validate TRT performance
+        trt_metrics = self._validate_trt_performance()
+        print(f"TRT Validation: mAP={trt_metrics[0]:.3f}, Latency={trt_metrics[1]:.3f}ms")
+
+    def _validate_trt_performance(self):
+        """Benchmark TensorRT model"""
+        # Warmup
+        dummy_image = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
+        self.detector.warmup()
+
+        # Latency test
+        start_time = time.time()
+        for _ in range(100):
+            _ = self.detector.detect(dummy_image)
+        latency = (time.time() - start_time) * 10  # ms per inference
+
+        # Accuracy test
+        val_dataset = UECFoodDataset(transform=val_transform)
+        acc = self._evaluate_trt_accuracy(val_dataset)
+
+        return acc, latency
+
+    def _evaluate_trt_accuracy(self, dataset):
+        """Validate TensorRT model accuracy"""
+        correct = 0
+        total = 0
+
+        for img, target in DataLoader(dataset, batch_size=32):
+            detections = self.detector.detect(img.numpy())
+            # Compare with ground truth
+            correct += calculate_accuracy(detections, target)
+            total += len(target)
+
+        return correct / total
+
 if __name__ == "__main__":
     config = {
+        "trt_engine_path": "models/yolov8_food.trt",
+        "trt_validation_freq": 10,  # Validate TRT every 10 epochs
+        "trt_calibration_data": "calibration_images/",
+        "qat_enabled": True,  # Quantization-Aware Training
         "data_root": "/path/to/uecfood256",
         "unlabeled_pool": "/path/to/unlabeled",
         "usda_key": "your_api_key",
