@@ -12,8 +12,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
 from torchvision.datasets import ImageFolder
-
-from food_detector import FoodDetector
+from model_factory import create_backbone, create_classification_head
 import matplotlib.pyplot as plt
 
 class ActiveLearner:
@@ -26,15 +25,12 @@ class ActiveLearner:
         self.current_dataset = ConcatDataset([self.base_dataset,
                                               Subset(self.unlabeled_pool, list(self.labeled_food))])
 
-    # def get_pool_loader(self, batch_size=64):
-    #     return DataLoader(self.unlabeled_pool, batch_size=batch_size)
-
-
 def display_image(img):
     plt.figure(figsize=(8,8))
     plt.imshow(img)
     plt.axis("off")
     plt.show()
+
 def human_labeling_interface(samples):
     labeled = []
     for img, pred in samples:
@@ -57,7 +53,8 @@ class FoodClassifier:
         """
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.num_classes = num_classes
-
+        self.feature_extractor = create_backbone("mobilenet_v3_small")
+        self.classifier = create_classification_head(in_features=576, num_classes=num_classes)
         # Initialize model
         self.model = torch.hub.load("pytorch/vision:v0.10.0",
                                     "mobilenet_v3_small", pretrained=True)

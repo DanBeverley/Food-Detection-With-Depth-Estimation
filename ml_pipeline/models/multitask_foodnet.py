@@ -1,8 +1,11 @@
 import torch
 from torch import nn
+from model_factory import create_backbone, create_multitask_head
 class MultiTaskFoodNet(nn.Module):
     def __init__(self, num_classes:int = 256):
         super().__init__()
+        self.feature_extractor = create_backbone()
+        self.nutrition_head = create_multitask_head(in_features=576)
         self.calories_scale = nn.Parameter(torch.tensor([500.0]))
         self.protein_scale = nn.Parameter(torch.tensor([100.0]))
         self.backbone = torch.hub.load("pytorch/vision", "mobilenet_v3_small",
@@ -19,11 +22,6 @@ class MultiTaskFoodNet(nn.Module):
         # Classification head
         self.class_head = nn.Sequential(nn.Linear(1024, 512),
                                         nn.ReLU(), nn.Linear(512, num_classes))
-        # Nutrition estimation head
-        self.nutrition_head = nn.Sequential(nn.Linear(in_features, 256),
-                                            nn.ReLU(),
-                                            nn.Linear(256, 4),
-                                            nn.Sigmoid()) #[calories, protein, fat, carbs]
     def forward(self, x):
         features = self.feature_extractor(x)
         features = features.view(features.size(0), -1) # Flatten

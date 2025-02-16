@@ -11,15 +11,13 @@ from torch.utils.data import Dataset, DataLoader
 
 import asyncio
 from typing import Dict, Any
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
 
 from pathlib import Path
 import logging
 
 class UECFoodDataset(Dataset):
-    def __init__(self, root_dir:str, transform:Callable, image_ext:str,
-                 nutrition_mapper=None):
+    def __init__(self, root_dir:str, transform:Callable=None, image_ext:str=".jpg", nutrition_mapper=None):
         """
         Args:
             root_dir (str): Root directory containing subfolders for each food category.
@@ -27,7 +25,7 @@ class UECFoodDataset(Dataset):
             image_ext (str): Extension of the image files (default '.jpg').
         """
         self.root_dir = Path(root_dir)
-        self.transform = transform
+        self.transform = transform or get_train_transforms()
         self.image_ext = image_ext
         self.nutrition_mapper = nutrition_mapper
         self.shape_mapper = UEC256ShapeMapper()
@@ -235,31 +233,6 @@ class UECFoodDataset(Dataset):
         # Example : Dome shape food volume = area^(3/2) * height_ratio
         volume = (bbox_area**1.5)*shape_prior.height_ratio
         return volume*shape_prior.volume_modifier
-
-
-# Define Augmentations
-# -------------------------
-# Training augmentations include resizing, cropping, flips, brightness/contrast adjustments,
-# and geometric transformations. The bounding boxes are transformed accordingly.
-
-train_transform = A.Compose([A.Resize(height=640, width=640),
-                             A.RandomCrop(height=224, width=224),
-                             A.HorizontalFlip(p=0.5),
-                             A.RandomBrightnessContrast(p=0.2),
-                             A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1,
-                                                rotate_limit=15, p=0.5),
-                             A.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std =[0.229, 0.224, 0.225]),
-                             ToTensorV2()], bbox_params=A.BboxParams(format="pascal_voc",
-                                                                     label_fields=["labels"]))
-
-val_transform = A.Compose([A.Resize(height=224, width=224),
-                           A.Normalize(mean=[0.485, 0.456, 0.406],
-                                       std =[0.229, 0.224, 0.225]),
-                           ToTensorV2()], bbox_params=A.BboxParams(format="pascal_voc",
-                                                                   label_fields=["labels"]))
-
-
 # Custom Collate Function
 def collate_fn(batch):
     images = []
@@ -280,8 +253,8 @@ def collate_fn(batch):
 
 # Creating DataLoaders
 dataset_root = ""
-train_dataset = UECFoodDataset(root_dir = dataset_root, transform = train_transform)
-val_dataset = UECFoodDataset(root_dir = dataset_root, transform = val_transform)
+train_dataset = UECFoodDataset(root_dir = dataset_root, transform = get_train_transforms())
+val_dataset = UECFoodDataset(root_dir = dataset_root, transform = get_val_transforms())
 train_loader = DataLoader(train_dataset, batch_size = 32,
                            shuffle = True, num_workers = 4,
                            pin_memory=True, collate_fn=collate_fn)

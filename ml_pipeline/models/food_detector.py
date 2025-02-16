@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from torch import nn
 from torch.ao.quantization import quantize_dynamic
+from ml_pipeline.utils.optimization import ModelOptimizer
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
@@ -96,11 +97,7 @@ class FoodDetector:
         return image
     def build_trt_engine(self, output_path="yolov8.trt"):
         """Export YOLOv8 to TensorRT engine with proper optimization"""
-        self.model.export(format="engine", imgsz=self.input_shape[1:],
-                          half=self.fp16_mode, workspace=self.workspace_size,
-                          simplify=True, int8=False, device=0, verbose=True)
-        if Path(output_path).exists():
-            self._load_engine(output_path)
+        ModelOptimizer.export_tensorrt(self.model, output_path=self.trt_engine)
 
     def _load_engine(self, engine_path):
         """Load pre-built TensorRT engine"""
@@ -289,10 +286,7 @@ class FoodDetector:
         return processed_mask
 
     def quantize(self):
-        self.model = torch.quantization.quantize_dynamic(self.model.to("cpu"),
-                                                         {nn.Conv2d, nn.Linear},
-                                                         dtype=torch.qint8)
-        self.model.eval()
+        self.model = ModelOptimizer.quantize_model(self.model)
 
     def train(self, data_yaml:str, epochs:int = 100, batch_size:int=16,
               image_size:int=640):

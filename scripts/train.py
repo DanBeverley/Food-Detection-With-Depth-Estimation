@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from datetime import datetime
+from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
+from ml_pipeline.utils.optimization import ModelOptimizer
 from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
 from ml_pipeline.data_processing.dataset_loader import *
 from ml_pipeline.models.food_detector import FoodDetector
@@ -18,7 +20,7 @@ class FoodTrainingSystem:
         # Initialize components
         self.nutrition_mapper = NutritionMapper(api_key=config["usda_key"])
         self.dataset = UECFoodDataset(root_dir=config["data_root"],
-                                      transform=train_transform,
+                                      transform=get_train_transforms(),
                                       nutrition_mapper=self.nutrition_mapper)
         self.detector = FoodDetector(quantized=config["quantize"])
         self.classifier = FoodClassifier(num_classes=256
@@ -41,7 +43,7 @@ class FoodTrainingSystem:
                                        shuffle=True, num_workers=8, pin_memory=True,
                                        collate_fn=collate_fn)
         self.val_loader = DataLoader(UECFoodDataset(root_dir=self.config["data_root"],
-                                                    transform=val_transform),
+                                                    transform=get_val_transforms()),
                                      batch_size=self.config["batch_size"],
                                      num_workers=4, collate_fn=collate_fn)
 
@@ -129,8 +131,8 @@ class FoodTrainingSystem:
         torch.save(checkpoint, f"checkpoints/{timestamp}_epoch{epoch}.pt")
 
     def _quantize_models(self):
-        self.detector.optimize_for_mobile()
-        self.classifier.quantize()
+        ModelOptimizer.quantize_model(self.detector.model)
+        ModelOptimizer.quantize_model(self.classifier.model)
         # Export to Tensor RT
         if self.device.type == "cuda":
             self.detector.build_trt_engine()
@@ -160,7 +162,7 @@ class FoodTrainingSystem:
         latency = (time.time() - start_time) * 10  # ms per inference
 
         # Accuracy test
-        val_dataset = UECFoodDataset(transform=val_transform)
+        val_dataset = UECFoodDataset(transform=get_val_transforms())
         acc = self._evaluate_trt_accuracy(val_dataset)
 
         return acc, latency

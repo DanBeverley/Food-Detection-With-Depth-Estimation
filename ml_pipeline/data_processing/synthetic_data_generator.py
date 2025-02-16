@@ -8,18 +8,14 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torchvision
+from ml_pipeline.utils.transforms import get_gan_transforms
 from torch import optim
 import torch.autograd as autograd
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
-from torchvision import transforms
 from torch.cuda.amp import autocast, GradScaler
 from torch.nn.utils import spectral_norm
-import albumentations as A
-
-
 from tqdm import tqdm
-from PIL import Image
 
 class FoodGANDataset(Dataset):
     def __init__(self, root_dir:str,image_dir:str,
@@ -27,14 +23,7 @@ class FoodGANDataset(Dataset):
         self.root_dir = Path(root_dir)
         self.mask_paths = {p.stem:p for p in (self.root_dir / mask_dir).glob("*.png")}
         self.image_paths = [p for p in (self.root_dir / image_dir).glob(f"*{image_ext}") if p.stem in self.mask_paths]
-        self.transform = transform or A.Compose([
-            A.Compose([
-                A.HorizontalFlip(p=0.5),
-                A.Rotate(limit=30),
-                A.RandomBrightnessContrast(p=0.2),
-                A.GridDistortion(p=0.3)
-            ], additional_targets={"mask":"mask"})
-        ])
+        self.transform = transform or get_gan_transforms()
         # Efficient recursive scan
         for root, _, files in os.walk(root_dir):
             for file in files:
@@ -91,21 +80,6 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self, nc=3, ndf=64):
         super().__init__()
-        # self.main = nn.Sequential(
-        #     nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
-        #     nn.LeakyReLU(0.2, inplace=True),
-        #     nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
-        #     nn.BatchNorm2d(ndf * 2),
-        #     nn.LeakyReLU(0.2, inplace=True),
-        #     nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
-        #     nn.BatchNorm2d(ndf * 4),
-        #     nn.LeakyReLU(0.2, inplace=True),
-        #     nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
-        #     nn.BatchNorm2d(ndf * 8),
-        #     nn.LeakyReLU(0.2, inplace=True),
-        #     nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
-        #     nn.Sigmoid()
-        # )
         # Use spectral normalization for each conv layer for stability.
         self.main = nn.Sequential(
             spectral_norm(nn.Conv2d(nc, ndf, 4, 2, 1, bias=False)),
@@ -246,8 +220,8 @@ class GANTrainer:
     def _save_checkpoint(self, epoch):
         torch.save(self.netG.state_dict(), f"G_epoch_{epoch + 1}.pth")
         torch.save(self.netD.state_dict(), f"D_epoch_{epoch + 1}.pth")
-    # Execution
-    # -------------------------
+# Execution
+# -------------------------
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
