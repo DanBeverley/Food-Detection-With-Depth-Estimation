@@ -87,7 +87,7 @@ class FoodDetector:
         if isinstance(image, str):
             image = cv2.imread(image)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        elif isinstance(image, np.ndarray) and image.ndim == 2:
+        elif isinstance(image, np.ndarray) and image.ndim == 3:
             if image.shape[2] == 3 and image.dtype == np.uint8:
                 if image[0,0,0] > image[0,0,2]: # Crude BGR check
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -149,9 +149,10 @@ class FoodDetector:
         """
 
         if self.scripted_model:
+            image_tensor = torch.from_numpy(image).to(self.device)
             if self.device.type == "cuda":
-                image = image.half() # Convert to FP16
-            results = self.scripted_model(image)
+                image_tensor = image_tensor.half() # Convert to FP16
+            results = self.scripted_model(image_tensor)
         else:
             results = self.model(image)
         image = self.preprocess_image(image)

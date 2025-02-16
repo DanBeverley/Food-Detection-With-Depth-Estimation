@@ -46,14 +46,14 @@ class HybridPortionEstimator:
         scale_ratio = self._calculate_scale(ref_objects, known_width_cm=8.5)
         return scale_ratio
 
-    def _get_region_depth(self, depth_map, mask):
+    def _get_region_depth(self, depth_map, mask, box=None):
         """Get average depth in masked region"""
         if mask is not None:
             valid_depths = depth_map[mask]
         else:  # Fallback to bounding box
             x1, y1, x2, y2 = map(int, box)
             valid_depths = depth_map[y1:y2,x1:x2].flatten()
-        return np.mean(valid_depths) if valid_depths.size>0 else .1
+        return np.mean(valid_depths) if valid_depths.size > 0 else .1
 
     def estimate_portion(self, image, food_boxes, food_labels, masks=None):
         """
@@ -191,13 +191,6 @@ class HybridPortionEstimator:
                 return (weight_g/100)*nutrition["calories_per_100g"]
         return weight_g*1.5 # Fallback 1.5 cal/g
 
-    def _get_region_depth(self, depth_map, box):
-        """Get average depth in food region"""
-        x1, y1, x2, y2 = map(int, box)
-        region = depth_map[y1:y2, x1:x2]
-        return np.mean(region) if region.size>0 else .1
-
-
 class UECVolumeEstimator:
     def __init__(self, food_shape_priors = None):
         self.food_shape_priors = food_shape_priors or self._get_default_shape_prior()
@@ -273,7 +266,7 @@ class UECVolumeEstimator:
         radius = np.sqrt(area_cm2/np.pi)
         height = max_height*prior["height_ratio"]
         volume = (1/6)*np.pi*height*(3*radius**2+height**2)
-        return volume*prior["volume_modifier"]
+        return volume*prior.volume_modifier
 
     def _estimate_bowl_content_volume(self, depth_map, mask, area_cm2, prior):
         """Estimate volume for food served in bowls"""
@@ -424,7 +417,14 @@ class UnifiedFoodEstimator:
         return mapping
 
     def estimate(self, image, detections):
-        """Unified estimation pipeline"""
+        """Unified estimation pipeline
+        Args:
+            detections: List of dicts with keys:
+                - 'bbox': [x1,y1,x2,y2]
+                - 'label': category ID
+                - 'mask': binary segmentation mask
+                - 'depth': cropped depth map for the food item
+        """
         results = []
         depth_map = self.hybrid_estimator._get_depth_map(image)
         for food in detections:

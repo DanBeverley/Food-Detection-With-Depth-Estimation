@@ -211,7 +211,7 @@ class FoodClassifier:
 
                 optimizer.zero_grad()
                 with torch.cuda.amp.autocast():
-                    outputs = checkpoint(custom_forward, images)
+                    outputs = self.model(images)
                     # Combine Loss
                     loss = 0.7*class_criterion(outputs["class"], labels)+\
                            0.3*nutrition_criterion(outputs["nutrition"],nutrition)
@@ -246,7 +246,7 @@ class FoodClassifier:
             if val_loss<best_val_loss:
                 best_val_loss=val_loss
                 torch.save(self.model.state_dict(), "best_model.pth")
-            print(f"Epoch {epochs+1}/{epochs}: ")
+            print(f"Epoch {epoch+1}/{epochs}: ")
             print(f"Train Loss: {train_loss/len(train_loader):.4f}")
             print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%")
 

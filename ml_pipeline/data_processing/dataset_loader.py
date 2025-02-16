@@ -69,7 +69,8 @@ class UECFoodDataset(Dataset):
         """Validate cached nutrition data"""
         if self.nutrition_mapper:
             for cat_id in self.id_to_category.values():
-                nutrition = self.nutrition_mapper.get_nutrition_data(cat_id)
+                food_name = self.id_to_category[cat_id]
+                nutrition = self.nutrition_mapper.get_nutrition_data(food_name)
                 if not nutrition:
                     raise ValueError(f"Missing nutrition data for {cat_id}")
 
@@ -210,10 +211,12 @@ class UECFoodDataset(Dataset):
                 bbox_area = (x2-x1)*(y2-y1)
                 portion =  self._estimate_portion(food_name, bbox_area)
 
-                target = {"boxes":torch.tensor(yolo_boxes, dtype=torch.float32),
-                          "labels":torch.tensor(labels, dtype=torch.int64),
-                          "portions":torch.tensor([portion], dtype=torch.float32),
-                          "nutrition":nutrition_data}
+                target.update({# "boxes":torch.tensor(yolo_boxes, dtype=torch.float32),
+                              # "labels":torch.tensor(labels, dtype=torch.int64),
+                              "portions":torch.tensor([portion], dtype=torch.float32),
+                              "nutrition":nutrition_data})
+        if "portions" not in target:
+            target["portions"] = torch.zeros(1, dtype=torch.float32)
         if "mask" in item:
             transformed = self.transform(image=image, bboxes=bboxes, labels=labels,
                                          mask=item["mask"])

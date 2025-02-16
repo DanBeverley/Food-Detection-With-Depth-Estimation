@@ -17,7 +17,7 @@ class MultiTaskFoodNet(nn.Module):
                                        nn.ReLU(),
                                        nn.Dropout(0.5))
         # Classification head
-        self.class_head = nn.Sequential(nn.Linear(in_features, 512),
+        self.class_head = nn.Sequential(nn.Linear(1024, 512),
                                         nn.ReLU(), nn.Linear(512, num_classes))
         # Nutrition estimation head
         self.nutrition_head = nn.Sequential(nn.Linear(in_features, 256),

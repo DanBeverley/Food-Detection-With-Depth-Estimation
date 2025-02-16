@@ -25,14 +25,8 @@ class FoodGANDataset(Dataset):
     def __init__(self, root_dir:str,image_dir:str,
                  mask_dir:str, transform:Callable=None, image_ext:str=".jpg"):
         self.root_dir = Path(root_dir)
-        # self.transform = transform or transforms.Compose([
-        #     transforms.Resize(128),
-        #     transforms.CenterCrop(128),
-        #     transforms.ToTensor(),
-        #     transforms.Normalize((.5,.5,.5), (.5,.5,.5))
-        # ])
-        self.image_paths = list((self.root_dir / image_dir).glob("*.jpg"))
-        self.mask_paths = list((self.root_dir / mask_dir).glob("*.png"))
+        self.mask_paths = {p.stem:p for p in (self.root_dir / mask_dir).glob("*.png")}
+        self.image_paths = [p for p in (self.root_dir / image_dir).glob(f"*{image_ext}") if p.stem in self.mask_paths]
         self.transform = transform or A.Compose([
             A.Compose([
                 A.HorizontalFlip(p=0.5),
@@ -41,8 +35,6 @@ class FoodGANDataset(Dataset):
                 A.GridDistortion(p=0.3)
             ], additional_targets={"mask":"mask"})
         ])
-        self.image_paths = []
-
         # Efficient recursive scan
         for root, _, files in os.walk(root_dir):
             for file in files:

@@ -124,7 +124,7 @@ class UEC256ShapeMapper:
     def get_shape_prior(self, food_category:str)->ShapePrior:
         """Get shape prior for a given food category"""
         # Clean the input category string
-        category = food_category.lower().strip().replace("","_")
+        category = food_category.lower().strip().replace(" ","_")
         return self.category_map.get(category, self.category_map["default"])
 
     def add_custom_category(self, category:str, shape:FoodShape,
