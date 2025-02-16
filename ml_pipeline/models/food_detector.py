@@ -1,6 +1,10 @@
 import torch
 import numpy as np
+from torch import nn
 from torch.ao.quantization import quantize_dynamic
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
 from ultralytics import YOLO
 from pathlib import Path
 import logging
@@ -16,6 +20,16 @@ class FoodDetector:
            confidence: Detection confidence threshold
            device: Device to run model on ('cuda', 'cpu', etc)
        """
+        self.trt_engine = None
+        self.context = None
+        self.inputs = []
+        self.outputs = []
+        self.bindings = []
+        self.stream = cuda.Stream()
+        self.fp16_mode = True
+        self.workspace_size = 1<<30 # Around 1GB
+        self.input_shape = (3, 640, 640)
+
         self.conf_threshold = confidence
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -80,6 +94,38 @@ class FoodDetector:
         else:
             raise ValueError("Image must be a path string or numpy array")
         return image
+    def build_trt_engine(self, output_path="yolov8.trt"):
+        """Export YOLOv8 to TensorRT engine with proper optimization"""
+        self.model.export(format="engine", imgsz=self.input_shape[1:],
+                          half=self.fp16_mode, workspace=self.workspace_size,
+                          simplify=True, int8=False, device=0, verbose=True)
+        if Path(output_path).exists():
+            self._load_engine(output_path)
+
+    def _load_engine(self, engine_path):
+        """Load pre-built TensorRT engine"""
+        logger = trt.Logger(trt.Logger.WARNING)
+        # Read engine file
+        with open(engine_path, "rb") as f, trt.Runtime(logger) as runtime:
+            self.trt_engine = runtime.deserialize_cuda_engine(f.read())
+        # Create execution context
+        self.context = self.trt_engine.create_execution_context()
+        # Allocate memory buffers
+        self._allocate_buffers()
+
+    def _allocate_buffers(self):
+        """Allocate input/output buffers for TensorRT"""
+        for binding in self.trt_engine:
+            size = trt.volume(self.trt_engine.get_binding_shape(binding))
+            dtype = trt.nptype(self.trt_engine.get_binding_dtype(binding))
+            # Allocate host and device buffers
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            self.bindings.append(int(device_mem))
+            if self.trt_engine.binding_is_input(binding):
+                self.inputs.append({"host":host_mem, "device":device_mem})
+            else:
+                self.outputs.append({"host":host_mem, "device":device_mem})
 
     def detect(self, image, return_masks=False):
         """
@@ -90,6 +136,7 @@ class FoodDetector:
         Returns:
             list of dict containing detection results
         """
+
         if self.scripted_model:
             if self.device.type == "cuda":
                 image = image.half() # Convert to FP16
@@ -129,6 +176,12 @@ class FoodDetector:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
         processed_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         return processed_mask
+
+    def quantize(self):
+        self.model = torch.quantization.quantize_dynamic(self.model.to("cpu"),
+                                                         {nn.Conv2d, nn.Linear},
+                                                         dtype=torch.qint8)
+        self.model.eval()
 
     def train(self, data_yaml:str, epochs:int = 100, batch_size:int=16,
               image_size:int=640):

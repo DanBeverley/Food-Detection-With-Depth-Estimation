@@ -5,6 +5,7 @@ import cv2
 from PIL import Image
 import numpy as np
 
+from torch import nn
 import torch.nn.functional as F
 import torch.cuda
 from torch.utils.data import ConcatDataset, DataLoader, Subset
@@ -172,7 +173,10 @@ class FoodClassifier:
         # 4. Retrain
         self.train(self.active_learner.train_loader, self.active_learner.val_loader)
 
-
+    def quantize(self):
+        self.model = quantize_dynamic(self.model.to("cpu"),
+                                      {nn.Linear, nn.Conv2d},
+                                      dtype=torch.qint8)
     def train(self, train_loader, val_loader, epochs:int=100, learning_rate:float=0.001):
         """
         Train the classifier
