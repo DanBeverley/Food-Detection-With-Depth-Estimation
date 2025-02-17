@@ -12,6 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 import asyncio
 from typing import Dict, Any
 from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
+from concurrent.futures import ThreadPoolExecutor
 
 from pathlib import Path
 import logging
@@ -49,19 +50,17 @@ class UECFoodDataset(Dataset):
         # Create tasks for all categories
         tasks = []
         category_names = list(self.id_to_category.values())
-
-        for cat_name in category_names:
-            tasks.append(self.nutrition_mapper.map_food_label_to_nutrition(cat_name))
-        # Run all requests in parallel
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(self.nutrition_mapper.map_food_label_to_nutrition, cat_name)
+                       for cat_name in category_names]
         # Process results
-        for cat_name, result in zip(category_names, results):
-            if isinstance(result, Exception):
-                logging.warning(f"Failed to load nutrition for {cat_name}: {str(result)}")
-                self.nutrition_cache[cat_name] = self.nutrition_mapper.get_default_nutrition()
-            else:
+        for cat_name, future in zip(category_names, futures):
+            try:
+                result = future.result()
                 self.nutrition_cache[cat_name] = result
+            except Exception as e:
+                logging.warning(f"Failed to load nutrition for {cat_name}: {str(e)}")
+                self.nutrition_cache[cat_name] = self.nutrition_mapper.get_default_nutrition()
 
     def _validate_nutrition_data(self):
         """Validate cached nutrition data"""
@@ -188,7 +187,7 @@ class UECFoodDataset(Dataset):
         for (x1, y1, x2, y2) in bboxes:
             x_center = ((x1+x2)/2)/width
             y_center = ((y1+y2)/2)/height
-            w = (x2-y1)/width
+            w = (x2-x1)/width
             h = (y2-y1)/height
             yolo_boxes.append([x_center, y_center, w, h])
 
@@ -224,6 +223,8 @@ class UECFoodDataset(Dataset):
                               # "labels":torch.tensor(labels, dtype=torch.int64),
                               "portions":torch.tensor([portion], dtype=torch.float32),
                               "nutrition":nutrition_data})
+        if "nutrition" not in target:
+            target["nutrition"] = torch.zeros(4, dtype=torch.float32)
         if "portions" not in target:
             target["portions"] = torch.zeros(1, dtype=torch.float32)
         if "mask" in item:

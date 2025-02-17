@@ -8,6 +8,7 @@ import numpy as np
 from torch import nn
 import torch.nn.functional as F
 import torch.cuda
+from torch.cuda.amp import GradScaler
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
@@ -168,7 +169,7 @@ class FoodClassifier:
         """
         if self.active_learner:
             train_loader = DataLoader(self.active_learner.current_dataset,
-                                      batch_size = 32, shuffle=True)
+                                      batch_size = 32, shuffle=True, pin_memory=True)
         class_criterion = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
         nutrition_criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
@@ -197,6 +198,7 @@ class FoodClassifier:
             print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%")
 
     def _train_epoch(self, train_loader, optimizer, class_criterion, nutrition_criterion):
+        scaler = GradScaler()
         self.model.train()
         total_loss = 0
 
@@ -210,8 +212,9 @@ class FoodClassifier:
                 outputs = self.model(images)
                 loss = (0.7 * class_criterion(outputs["class"], labels) +
                         0.3 * nutrition_criterion(outputs["nutrition"], nutrition))
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item()
 
@@ -224,7 +227,7 @@ class FoodClassifier:
         total = 0
 
         with torch.inference_mode():
-            for images, labels in val_loader:
+            for images, (labels, nutrition) in val_loader:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
 

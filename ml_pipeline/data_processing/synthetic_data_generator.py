@@ -32,6 +32,12 @@ class FoodGANDataset(Dataset):
                             if p.stem in self.mask_paths]
         if not self.image_paths:
             raise ValueError(f"No matching images found in {image_dir}")
+    def __len__(self):
+        return len(self.image_paths)
+    def __getitem__(self, idx):
+        img = cv2.imread(self.image_paths[idx])
+        mask = cv2.imread(self.mask_paths[self.image_paths[idx].stem])
+        return self.transform(image=img, mask = mask)
 
 class Generator(nn.Module):
     def __init__(self, nz:int=100, ngf:int=64, nc:int=3):
@@ -93,7 +99,8 @@ class Discriminator(nn.Module):
 
 def compute_gradient_penalty(D:nn.Module, real_samples:torch.Tensor,
                              fake_samples:torch.Tensor,
-                             device:torch.cuda.device)->torch.Tensor:
+                             device:torch.cuda.device,
+                             lambda_gp:float=10.0)->torch.Tensor:
     batch_size = real_samples.size(0)
     alpha = torch.rand(batch_size, 1, 1, 1, device = device)
     interpolates = (alpha*real_samples + ((1-alpha)*fake_samples)).requires_grad_(True)

@@ -1,8 +1,4 @@
-"""For mapping food labels with their calorie and macro data with USDA FoodData Central API"""
 import logging
-
-import requests
-import json
 import csv
 import os
 import asyncio
@@ -143,7 +139,7 @@ class NutritionMapper:
         """Cache data in both Redis and local cache"""
         self.cache[key.split(":")[1]] = nutrition
 
-        if self.redis:
+        if self.redis is not None:
             try:
                 # Store with 24-hour TTL
                 self.redis.hset(key, mapping=nutrition)

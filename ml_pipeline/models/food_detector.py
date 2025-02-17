@@ -1,7 +1,5 @@
 import torch
 import numpy as np
-from torch import nn
-from torch.ao.quantization import quantize_dynamic
 from ml_pipeline.utils.optimization import ModelOptimizer
 import tensorrt as trt
 import pycuda.driver as cuda
@@ -36,7 +34,7 @@ class FoodDetector:
             self.quantize()
 
         # Half precision optimization
-        if half_precision and device.type == "cuda":
+        if half_precision and torch.cuda.is_available() and device.type == "cuda":
             self.model = self.model.half()
 
         self._setup_tensorrt()
@@ -50,8 +48,22 @@ class FoodDetector:
         self.inputs = []
         self.outputs = []
         self.input_shape = (3, 640, 640)
+    def __del__(self):
+        if self.context:
+            self.context.__del__()
+        if self.trt_engine:
+            self.trt_engine.__del__()
 
-    def preprocess_image(self, image):
+    def detect_batch(self, images:torch.Tensor, batch_size:int=32):
+        """Process images in batches"""
+        results = []
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i+batch_size]
+            batch_results = self.model(batch, conf=self.conf_threshold)
+            results.extend(self._process_results(batch_results))
+        return results
+
+    def preprocess_image(self, image:torch.Tensor):
         """Preprocess image for YOLO model"""
         if isinstance(image, str):
             image = cv2.imread(image)

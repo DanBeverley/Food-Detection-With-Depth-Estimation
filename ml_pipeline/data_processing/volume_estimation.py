@@ -169,8 +169,9 @@ class HybridPortionEstimator:
         physical_size = reference_sizes.get(best_ref["label"], known_width_cm)
         return physical_size/ref_width
     @lru_cache(maxsize=32)
-    def _get_depth_map(self, image_hash):
+    def _get_depth_map(self, image):
         """Get depth map using MiDaS"""
+        image_hash = hash(image.tobytes())
         return self.midas(image_hash)
 
     def _calculate_volume_confidence(self, depth_quality:float, mask_quality:float,

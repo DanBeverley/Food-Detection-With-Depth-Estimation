@@ -1,3 +1,5 @@
+import logging
+
 import torch
 from torch import nn
 from model_factory import create_backbone, get_feature_dim, create_multitask_head
@@ -9,6 +11,7 @@ class MultiTaskFoodNet(nn.Module):
         in_features = get_feature_dim(self.feature_extractor)
         self.shared_fc = nn.Sequential(
             nn.Linear(in_features, 1024),
+            nn.BatchNorm1d(1024),
             nn.ReLU(),
             nn.Dropout(0.5)
         )
@@ -24,15 +27,24 @@ class MultiTaskFoodNet(nn.Module):
         # Initialize scaling factors as registered buffers instead of parameters
         self.register_buffer('calories_scale', torch.tensor([500.0]))
         self.register_buffer('protein_scale', torch.tensor([100.0]))
+        def init_weights(m):
+            if isinstance(m ,nn.Linear):
+                torch.nn.init.kaiming_normal_(m.weight)
+                m.bias.fill_(0.01)
+        self.apply(init_weights)
+    def forward(self, x:torch.Tensor):
+        try:
+            features = self.feature_extractor(x)
+            features = features.view(features.size(0), -1) # Flatten
+            shared = self.shared_fc(features)
+            # Scale outputs to realistic ranges
+            nutrition = self.nutrition_head(shared)
+            nutrition[:,0] *= self.calories_scale
+            nutrition[:,1] *= self.protein_scale
 
-    def forward(self, x):
-        features = self.feature_extractor(x)
-        features = features.view(features.size(0), -1) # Flatten
-        shared = self.shared_fc(features)
-        # Scale outputs to realistic ranges
-        nutrition = self.nutrition_head(shared)
-        nutrition[:,0] *= self.calories_scale
-        nutrition[:,1] *= self.protein_scale
+            return {"class":self.class_head(shared),
+                    "nutrition":nutrition}
+        except RuntimeError as e:
+            logging.error(f"Forward pass failed: {e}")
+            raise
 
-        return {"class":self.class_head(shared),
-                "nutrition":nutrition}
