@@ -6,14 +6,6 @@ def create_backbone(arch="mobilenet_v3_small", pretrained=True):
     model = torch.hub.load("pytorch/vision:v0.10.0", arch, pretrained=pretrained)
     return nn.Sequential(*list(model.children())[:-1])
 
-def create_classification_head(in_features, num_classes):
-    """Create classification head with adaptive features"""
-    return nn.Sequential(
-        nn.AdaptiveAvgPool2d((1, 1)),
-        nn.Flatten(),
-        nn.Linear(in_features, num_classes)
-    )
-
 def create_multitask_head(in_features):
     """Create nutrition estimation head"""
     return nn.Sequential(
@@ -22,3 +14,9 @@ def create_multitask_head(in_features):
         nn.Linear(256, 4),
         nn.Sigmoid()
     )
+
+def get_feature_dim(backbone, input_size=(3, 256, 256)):
+    with torch.no_grad():
+        dummy_input = torch.randn(1, *input_size)
+        features = backbone(dummy_input)
+        return features.view(-1).shape[0]

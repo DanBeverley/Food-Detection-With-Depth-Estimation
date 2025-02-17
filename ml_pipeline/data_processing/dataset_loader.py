@@ -65,16 +65,24 @@ class UECFoodDataset(Dataset):
 
     def _validate_nutrition_data(self):
         """Validate cached nutrition data"""
-        if self.nutrition_mapper:
-            for cat_id in self.id_to_category.values():
-                food_name = self.id_to_category[cat_id]
+        if not self.nutrition_mapper:
+            return
+        for cat_id, food_name in self.id_to_category.items():
+            try:
                 nutrition = self.nutrition_mapper.get_nutrition_data(food_name)
                 if not nutrition:
-                    raise ValueError(f"Missing nutrition data for {cat_id}")
+                    logging.warning(f"Missing nutrition data for {food_name}")
+                    continue
 
                 required_keys = ["calories", "protein", "fat", "carbohydrates"]
-                if not all(k in nutrition for k in required_keys):
-                    raise ValueError(f"Incomplete nutrition data for {cat_id}")
+                missing_keys = [k for k in required_keys if k not in nutrition]
+                if missing_keys:
+                    logging.warning(f"Missing keys {missing_keys} for {food_name}")
+            except Exception as e:
+                logging.error(f"Error validating nutrition for {food_name}: {e}")
+
+    def process_batch(self, indices):
+        return [self.__getitem__(i) for i in indices]
 
     def _read_category_file(self):
         categories_file = os.path.join(self.root_dir, "category.txt")
@@ -156,6 +164,9 @@ class UECFoodDataset(Dataset):
             mask = (mask>127).astype(np.float32) # Convert to binary float mask
             item["mask"] = mask
 
+        if mask is not None and not isinstance(mask, np.ndarray):
+            raise ValueError(f"Invalid mask type: {type(mask)}")
+
         # Load the image using OpenCV and convert BGR to RGB
         image = cv2.imread(item["image_path"])
         if image is None:
@@ -175,7 +186,7 @@ class UECFoodDataset(Dataset):
         height, width = image.shape[1], image.shape[2] # Transformed image shape (C,H,W)
         yolo_boxes = []
         for (x1, y1, x2, y2) in bboxes:
-            x_center = ((x1+y2)/2)/width
+            x_center = ((x1+x2)/2)/width
             y_center = ((y1+y2)/2)/height
             w = (x2-y1)/width
             h = (y2-y1)/height

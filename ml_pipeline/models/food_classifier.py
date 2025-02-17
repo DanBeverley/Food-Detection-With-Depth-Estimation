@@ -12,7 +12,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
 from torchvision.datasets import ImageFolder
-from model_factory import create_backbone, create_classification_head
+from multitask_foodnet import MultiTaskFoodNet
 import matplotlib.pyplot as plt
 
 class ActiveLearner:
@@ -42,8 +42,8 @@ def human_labeling_interface(samples):
 
 class FoodClassifier:
     def __init__(self, model_path:str=None, num_classes:int=256,
-                 device:torch.device = None, quantized:bool = None,
-                 active_learner = None, label_smoothing=0.1,  **kwargs):
+                 device:torch.device = None, quantized:bool = False,
+                 active_learner = None, label_smoothing=0.1):
         """
         Initialize food classifier with MobileNetV3
         Args:
@@ -53,27 +53,21 @@ class FoodClassifier:
         """
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.num_classes = num_classes
-        self.feature_extractor = create_backbone("mobilenet_v3_small")
-        self.classifier = create_classification_head(in_features=576, num_classes=num_classes)
+
         # Initialize model
-        self.model = torch.hub.load("pytorch/vision:v0.10.0",
-                                    "mobilenet_v3_small", pretrained=True)
-        self.model.classifier[-1] = torch.nn.Linear(in_features = self.model.classifier[-1].in_features,
-                                                    out_features = num_classes)
+        self.model = MultiTaskFoodNet(num_classes=num_classes)
+
         # Load train weights if provided
         if model_path and Path(model_path).exists():
             self.model.load_state_dict(torch.load(model_path,
                                                   map_location=self.device))
         # Quantization
         if quantized:
-            self._fuse_layers()
-            self.model = quantize_dynamic(self.model.to("cpu"), # Dynamic quantization works best on CPU
-                                          {torch.nn.Linear, torch.nn.Conv2d}, dtype = torch.qint8)
+            self.quantize()
         self.active_learner = active_learner
         self.unlabeled_pool = []
         self.label_smoothing = label_smoothing
         self.model = self.model.to(device)
-        self.model.eval()
 
         # Setup image preprocessing
         self.transform = transforms.Compose([transforms.Resize(256),
@@ -138,17 +132,6 @@ class FoodClassifier:
         return {"class_id":int(class_idx),
                 "confidence":float(prob)}
 
-    def _fuse_layers(self):
-        """Fuse Conv+BN+ReLU layers for quantization compatibility"""
-        for module_name, module in self.model.named_children():
-            if "features" in module_name:
-                torch.quantization.fuse_modules(module, [["0.0","0.1","0.2"]], # Conv2d + BN + ReLU
-                                                inplace = True)
-    def calibrate(self, calibration_loader):
-        self.model.eval()
-        with torch.no_grad():
-            for images, _ in calibration_loader:
-                _ = self.model(images.to("cpu"))
     def get_uncertain_samples(self, pool_loader, top_k=100):
         """Identify top-k most uncertain samples"""
         uncertainties = []
@@ -183,99 +166,77 @@ class FoodClassifier:
             epochs: Number of training epochs
             learning_rate: Learning rate
         """
-        from torch.utils.checkpoint import checkpoint
-        def custom_forward(x):
-            return self.model(x)
         if self.active_learner:
             train_loader = DataLoader(self.active_learner.current_dataset,
                                       batch_size = 32, shuffle=True)
-        class_criterion = torch.nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
-        nutrition_criterion = torch.nn.MSELoss()
+        class_criterion = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+        nutrition_criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
-                                                               patience=5, factor=.5)
+                                                               patience=5, factor=0.5)
         best_val_loss = float("inf")
 
         for epoch in range(epochs):
-            """Training"""
-            self.model.train()
-            train_loss = 0
-            for images, (labels, nutrition) in train_loader:
+            # Training
+            train_loss = self._train_epoch(train_loader, optimizer,
+                                           class_criterion, nutrition_criterion)
 
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-                nutrition = nutrition.to(self.device)
-
-                optimizer.zero_grad()
-                with torch.cuda.amp.autocast():
-                    outputs = self.model(images)
-                    # Combine Loss
-                    loss = 0.7*class_criterion(outputs["class"], labels)+\
-                           0.3*nutrition_criterion(outputs["nutrition"],nutrition)
-                loss.backward()
-                optimizer.step()
-
-                train_loss += loss.item()
             # Validation
-            self.model.eval()
-            val_loss = 0
-            correct = 0
-            total = 0
-
-            # with torch.no_grad():
-            with torch.inference_mode():
-                for images, labels in val_loader:
-                    images, labels = images.to(self.device), labels.to(self.device)
-                    outputs = self.model(images)
-                    loss = class_criterion(outputs, labels)
-
-                    val_loss += loss.item()
-                    _, predicted = outputs.max(1)
-                    total += labels.size(0)
-                    correct += predicted.eq(labels).sum().item()
-            val_accuracy = 100.*correct/total
-            val_loss = val_loss/len(val_loader)
+            val_loss, val_accuracy = self._validate_epoch(val_loader, class_criterion)
 
             # Update learning rate
             scheduler.step(val_loss)
 
             # Save best model
-            if val_loss<best_val_loss:
-                best_val_loss=val_loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 torch.save(self.model.state_dict(), "best_model.pth")
-            print(f"Epoch {epoch+1}/{epochs}: ")
-            print(f"Train Loss: {train_loss/len(train_loader):.4f}")
+
+            print(f"Epoch {epoch + 1}/{epochs}:")
+            print(f"Train Loss: {train_loss:.4f}")
             print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%")
 
-# For example usage
-# if __name__ == "__main__":
-#     # Initialize detector and classifier
-#     detector = FoodDetector(confidence=0.5)
-#     classifier = FoodClassifier(num_classes=256)
-#
-#     # Load and process an image
-#     image_path = "example_food.jpg"
-#     image = cv2.imread(image_path)
-#     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-#
-#     # Detect food items
-#     detections = detector.detect(image_rgb)
-#
-#     # Classify each detection
-#     results = []
-#     for det in detections:
-#         bbox = det['bbox']
-#         classification = classifier.classify_crop(image_rgb, bbox)
-#
-#         results.append({
-#             'bbox': bbox,
-#             'detection_conf': det['confidence'],
-#             'class_id': classification['class_id'],
-#             'classification_conf': classification['confidence']
-#         })
-#
-#     print(f"Found {len(results)} food items:")
-#     for r in results:
-#         print(f"Class {r['class_id']} at {r['bbox']} with confidence {r['classification_conf']:.2f}")
+    def _train_epoch(self, train_loader, optimizer, class_criterion, nutrition_criterion):
+        self.model.train()
+        total_loss = 0
+
+        for images, (labels, nutrition) in train_loader:
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+            nutrition = nutrition.to(self.device)
+
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                outputs = self.model(images)
+                loss = (0.7 * class_criterion(outputs["class"], labels) +
+                        0.3 * nutrition_criterion(outputs["nutrition"], nutrition))
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        return total_loss / len(train_loader)
+
+    def _validate_epoch(self, val_loader, criterion):
+        self.model.eval()
+        total_loss = 0
+        correct = 0
+        total = 0
+
+        with torch.inference_mode():
+            for images, labels in val_loader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                outputs = self.model(images)
+                loss = criterion(outputs["class"], labels)
+
+                total_loss += loss.item()
+                _, predicted = outputs["class"].max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+
+        return total_loss / len(val_loader), 100. * correct / total
+
 
 

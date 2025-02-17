@@ -1,11 +1,5 @@
-import torch
-import asyncio
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
-from datetime import datetime
-from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
-from ml_pipeline.utils.optimization import ModelOptimizer
 from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
 from ml_pipeline.data_processing.dataset_loader import *
 from ml_pipeline.models.food_detector import FoodDetector
@@ -13,187 +7,229 @@ from ml_pipeline.models.food_classifier import FoodClassifier, ActiveLearner, hu
 
 
 class FoodTrainingSystem:
-    def __init__(self, config):
-        self.config = config
+    def __init__(self, config:dict):
+        self.config = self._validate_config(config)
         self.device = torch.device(config["device"])
-        self.trt_engine_path = config.get("trt_engine_path", "models/yolov8.trt")
+
         # Initialize components
-        self.nutrition_mapper = NutritionMapper(api_key=config["usda_key"])
-        self.dataset = UECFoodDataset(root_dir=config["data_root"],
-                                      transform=get_train_transforms(),
-                                      nutrition_mapper=self.nutrition_mapper)
-        self.detector = FoodDetector(quantized=config["quantize"])
-        self.classifier = FoodClassifier(num_classes=256
-                                         , active_learner=ActiveLearner(self.dataset,
-                                                                        config["unlabeled_pool"]),
-                                         device=self.device)
-        # Optimization tools
+        self._init_components()
+        self._init_optimization()
+
+        # Training state
+        self.current_epoch = 0
+        self.best_val_loss = float('inf')
+        self.early_stopping_counter = 0
+
+    def _validate_config(self, config: dict) -> dict:
+        """Validate and set default configuration values"""
+        defaults = {
+            "batch_size": 32,
+            "epochs": 100,
+            "lr": 3e-4,
+            "mixed_precision": True,
+            "early_stopping_patience": 10,
+            "qat_start_epoch": 5,
+            "trt_validation_freq": 10,
+        }
+        return {**defaults, **config}
+
+    def _init_components(self):
+        """Initialize all model components"""
+        # Data handling
+        self.nutrition_mapper = NutritionMapper(api_key=self.config["usda_key"])
+        self.dataset = UECFoodDataset(
+            root_dir=self.config["data_root"],
+            transform=get_train_transforms(),
+            nutrition_mapper=self.nutrition_mapper
+        )
+
+        # Models
+        self.detector = FoodDetector(
+            quantized=self.config["quantize"],
+            device=self.device
+        )
+
+        self.classifier = FoodClassifier(
+            num_classes=256,
+            active_learner=ActiveLearner(
+                self.dataset,
+                self.config["unlabeled_pool"]
+            ) if self.config.get("active_learning") else None,
+            device=self.device
+        )
+
+    def _init_optimization(self):
+        """Initialize optimization components"""
         self.scaler = GradScaler()
-        self.optimizer = torch.optim.AdamW([{"params":self.classifier.model.parameters()},
-                                            {"params":self.detector.model.parameters(),
-        "lr":config["lr"]*0.1}], lr=config["lr"], weight_decay=1e-4)
+        self.optimizer = torch.optim.AdamW([
+            {
+                "params": self.classifier.model.parameters(),
+                "lr": self.config["lr"]
+            },
+            {
+                "params": self.detector.model.parameters(),
+                "lr": self.config["lr"] * 0.1
+            }
+        ], weight_decay=1e-4)
 
-    async def initialize(self):
-        "Async initialization"
-        await self.dataset.initialize()
-        self._prepare_data_loaders()
-
-    def _prepare_data_loaders(self):
-        self.train_loader = DataLoader(self.dataset, batch_size=self.config["batch_size"],
-                                       shuffle=True, num_workers=8, pin_memory=True,
-                                       collate_fn=collate_fn)
-        self.val_loader = DataLoader(UECFoodDataset(root_dir=self.config["data_root"],
-                                                    transform=get_val_transforms()),
-                                     batch_size=self.config["batch_size"],
-                                     num_workers=4, collate_fn=collate_fn)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', patience=5, factor=0.5
+        )
 
     async def train_epoch(self, epoch):
+        """Training for one epoch"""
         self.classifier.model.train()
+        self.detector.model.train()
         total_loss = 0
         for batch_idx, (images, targets) in enumerate(self.train_loader):
-            images = images.to(self.device, non_blocking=True)
-            # Mixed precision training
-            if self.config["qat_enabled"] and epoch == self.config["qat_start_epoch"]:
-                self.detector.prepare_for_qat()
-                self.detector.calibrate_model(calib_loader)
-            with autocast(enabled = self.config["mixed_precision"]):
-                detections = self.detector.detect(images, return_masks=True)
-                # Classification and Nutrition
-                class_outputs = self.classifier.model(images)
-                # Multi-task loss
-                loss = self._calculate_loss(class_outputs, targets)
-            # Backprop
-            self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            loss = await self._train_step(images, targets, batch_idx, epoch)
+            total_loss += loss
 
-            # Active learning every 100 batches
-            if batch_idx % 100 == 0:
-                await self._active_learning_step()
-            total_loss += loss.item()
             if batch_idx % 10 == 0:
-                print(f"Epoch {epoch} | Batch {batch_idx} | Loss: {loss.item():.4f}")
+                self._log_progress(epoch, batch_idx, loss)
         return total_loss/len(self.train_loader)
 
-    def _calculate_loss(self, outputs, targets):
-        # Classification loss
-        cls_loss = F.cross_entropy(outputs["class"], targets["labels"])
-        # Nutrition estimation loss
-        nut_loss = F.mse_loss(outputs["nutrition"], targets["nutrition"])
-        # Portion estimation loss
-        portion_loss = F.l1_loss(outputs["portions"], targets["portions"])
+    async def _train_step(self, images, targets, batch_idx: int, epoch: int) -> float:
+        """Single training step"""
+        images = images.to(self.device, non_blocking=True)
 
-        return cls_loss+0.3*nut_loss+0.2*portion_loss
+        # QAT handling
+        if self._should_start_qat(epoch):
+            self._initialize_qat()
 
-    async def _active_learning_step(self):
-        uncertain_samples = self.classifier.get_uncertain_samples(self.train_loader)
-        labeled_data = await asyncio.to_thread(human_labeling_interface, uncertain_samples)
-        self.classifier.active_learner.update_dataset(labeled_data)
-        self._prepare_data_loaders()  # Refresh with new data
+        # Mixed precision training
+        with autocast(enabled=self.config["mixed_precision"]):
+            loss = self._forward_pass(images, targets)
+
+        # Optimization
+        self.optimizer.zero_grad()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+        # Active learning
+        if self.config.get("active_learning") and batch_idx % 100 == 0:
+            await self._active_learning_step()
+
+        return loss.item()
+
+    def _forward_pass(self, images, targets) -> torch.Tensor:
+        """Forward pass through both models"""
+        detections = self.detector.detect(images, return_masks=True)
+        class_outputs = self.classifier.model(images)
+
+        return self._calculate_loss(
+            class_outputs,
+            targets,
+            detections
+        )
+
+    def _calculate_loss(self, outputs, targets, detections) -> torch.Tensor:
+        """Calculate combined loss"""
+        weights = self.config.get("loss_weights", {
+            "classification": 1.0,
+            "nutrition": 0.3,
+            "portion": 0.2
+        })
+
+        losses = {
+            "classification": F.cross_entropy(
+                outputs["class"],
+                targets["labels"]
+            ),
+            "nutrition": F.mse_loss(
+                outputs["nutrition"],
+                targets["nutrition"]
+            ),
+            "portion": F.l1_loss(
+                outputs["portions"],
+                targets["portions"]
+            )
+        }
+
+        return sum(weight * loss for loss, weight in zip(losses.values(), weights.values()))
+
+    def _should_start_qat(self, epoch: int) -> bool:
+        """Check if QAT should be initialized"""
+        return (
+            self.config["qat_enabled"] and
+            epoch == self.config["qat_start_epoch"] and
+            not hasattr(self, 'qat_initialized')
+        )
+
+    def _initialize_qat(self):
+        """Initialize Quantization Aware Training"""
+        self.detector.prepare_for_qat()
+        self.classifier.prepare_for_qat()
+        self.detector.calibrate_model(self.val_loader)
+        self.quat_initialized = True
 
     async def run_training(self):
+        """Main training loop"""
         await self.initialize()
+
         for epoch in range(self.config["epochs"]):
+            self.current_epoch = epoch
+
+            # Training
             train_loss = await self.train_epoch(epoch)
+
+            # Validation
             val_loss = self.validate()
-            # Save checkpoint
-            self._save_checkpoint(epoch, train_loss, val_loss)
-            print(f"Epoch {epoch} Complete | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-            # Quantize after 5 epochs
-            if epoch == 5 and self.config["quantize"]:
-                self._quantize_models()
-            if epoch%10 == 0:
+
+            # Learning rate scheduling
+            self.scheduler.step(val_loss)
+
+            # Model saving and early stopping
+            if self._handle_validation_results(train_loss, val_loss):
+                break
+
+            # TensorRT export
+            if self._should_export_trt(epoch):
                 self._export_trt_checkpoint(epoch)
 
-    def validate(self):
-        self.classifier.model.eval()
-        total_loss=0
-        with torch.no_grad():
-            for images, targets in self.val_loader:
-                images = images.to(self.device)
-                outputs = self.classifier.model(images)
-                loss = self._calculate_loss(outputs, targets)
-                total_loss += loss.item()
-        return total_loss/len(self.val_loader)
+    def _handle_validation_results(self, train_loss: float, val_loss: float) -> bool:
+        """Handle validation results and early stopping"""
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            self._save_checkpoint("best")
+            self.early_stopping_counter = 0
+        else:
+            self.early_stopping_counter += 1
 
-    def _save_checkpoint(self, epoch, train_loss, val_loss):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        checkpoint = {"classifier":self.classifier.model.state_dict(),
-                      "detector":self.detector.model.state_dict(),
-                      "optimizer":self.optimizer.state_dict(),
-                      "epoch":epoch,
-                      "losses":(train_loss, val_loss),
-                      "trt_compatibility": "fp16" if self.config["fp16"] else "fp32",
-                      "input_shape": self.detector.input_shape,
-                      "calibration_data": self.config["trt_calibration_data"]
-                      }
-        torch.save(checkpoint, f"checkpoints/{timestamp}_epoch{epoch}.pt")
+        self._save_checkpoint(f"epoch_{self.current_epoch}")
 
-    def _quantize_models(self):
-        ModelOptimizer.quantize_model(self.detector.model)
-        ModelOptimizer.quantize_model(self.classifier.model)
-        # Export to Tensor RT
-        if self.device.type == "cuda":
-            self.detector.build_trt_engine()
+        # Early stopping
+        if self.early_stopping_counter >= self.config["early_stopping_patience"]:
+            print(f"Early stopping triggered after {self.current_epoch + 1} epochs")
+            return True
 
-    def _export_trt_checkpoint(self, epoch):
-        """Export best model to TensorRT format"""
-        # Load best weights
-        self.detector.model = YOLO(f"checkpoints/best_epoch{epoch}.pt")
+        return False
 
-        # Export to TensorRT
-        self.detector.build_trt_engine(output_path=self.trt_engine_path)
-
-        # Validate TRT performance
-        trt_metrics = self._validate_trt_performance()
-        print(f"TRT Validation: mAP={trt_metrics[0]:.3f}, Latency={trt_metrics[1]:.3f}ms")
-
-    def _validate_trt_performance(self):
-        """Benchmark TensorRT model"""
-        # Warmup
-        dummy_image = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
-        self.detector.warmup()
-
-        # Latency test
-        start_time = time.time()
-        for _ in range(100):
-            _ = self.detector.detect(dummy_image)
-        latency = (time.time() - start_time) * 10  # ms per inference
-
-        # Accuracy test
-        val_dataset = UECFoodDataset(transform=get_val_transforms())
-        acc = self._evaluate_trt_accuracy(val_dataset)
-
-        return acc, latency
-
-    def _evaluate_trt_accuracy(self, dataset):
-        """Validate TensorRT model accuracy"""
-        correct = 0
-        total = 0
-
-        for img, target in DataLoader(dataset, batch_size=32):
-            detections = self.detector.detect(img.numpy())
-            # Compare with ground truth
-            correct += calculate_accuracy(detections, target)
-            total += len(target)
-
-        return correct / total
+    def _should_export_trt(self, epoch: int) -> bool:
+        """Check if TensorRT export should be performed"""
+        return (
+                self.device.type == "cuda" and
+                epoch % self.config["trt_validation_freq"] == 0
+        )
 
 if __name__ == "__main__":
     config = {
         "trt_engine_path": "models/yolov8_food.trt",
-        "trt_validation_freq": 10,  # Validate TRT every 10 epochs
-        "trt_calibration_data": "calibration_images/",
-        "qat_enabled": True,  # Quantization-Aware Training
         "data_root": "/path/to/uecfood256",
         "unlabeled_pool": "/path/to/unlabeled",
         "usda_key": "your_api_key",
-        "batch_size": 64,
-        "epochs": 100,
-        "lr": 3e-4,
+        "active_learning": True,
+        "qat_enabled": True,
+        "mixed_precision": True,
         "quantize": True,
-        "device": "cuda" if torch.cuda.is_available() else "cpu"
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "loss_weights": {
+            "classification": 1.0,
+            "nutrition": 0.3,
+            "portion": 0.2
+        }
     }
+
     system = FoodTrainingSystem(config)
     asyncio.run(system.run_training())
