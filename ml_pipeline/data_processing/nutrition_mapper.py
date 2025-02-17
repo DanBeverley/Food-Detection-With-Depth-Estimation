@@ -28,45 +28,14 @@ class NutritionMapper:
         self._verify_redis_connection()
         self.cache = self._load_cache()
         self.density_db = {
-            "rice": 0.05,
-            "white rice": 0.05,
-            "brown rice": 0.05,
-            "bread": 0.03,
-            "whole wheat bread": 0.03,
-            "meat": 0.08,
-            "chicken": 0.08,
-            "beef": 0.09,
-            "pork": 0.08,
-            "fish": 0.08,
-            "pasta": 0.06,
-            "potato": 0.07,
-            "vegetables": 0.04,
-            "broccoli": 0.04,
-            "carrot": 0.04,
-            "salad": 0.02,
-            "fruit": 0.04,
-            "apple": 0.04,
-            "banana": 0.04,
-            "orange": 0.04,
-            "cereal": 0.03,
-            "oatmeal": 0.05,
-            "soup": 0.09,
-            "stew": 0.09,
-            "cheese": 0.1,
-            "egg": 0.09,
-            "burger": 0.12,
-            "pizza": 0.1,
-            "taco": 0.07,
-            "pancakes": 0.04,
-            "waffles": 0.04,
-            "cookies": 0.03,
-            "brownie": 0.03,
-            "cake": 0.03,
-            "pie": 0.03,
-            "yogurt": 0.05,
-            "ice cream": 0.06,
-            "almonds": 0.07,
-            "peanuts": 0.07
+            "rice": 0.05, "white rice": 0.05, "brown rice": 0.05, "bread": 0.03,
+            "whole wheat bread": 0.03, "meat": 0.08, "chicken": 0.08, "beef": 0.09,
+            "pork": 0.08, "fish": 0.08, "pasta": 0.06, "potato": 0.07, "vegetables": 0.04,
+            "broccoli": 0.04, "carrot": 0.04, "salad": 0.02, "fruit": 0.04, "apple": 0.04,
+            "banana": 0.04, "orange": 0.04, "cereal": 0.03, "oatmeal": 0.05, "soup": 0.09,
+            "stew": 0.09, "cheese": 0.1, "egg": 0.09, "burger": 0.12, "pizza": 0.1, "taco": 0.07,
+            "pancakes": 0.04, "waffles": 0.04, "cookies": 0.03, "brownie": 0.03, "cake": 0.03,
+            "pie": 0.03, "yogurt": 0.05, "ice cream": 0.06, "almonds": 0.07, "peanuts": 0.07
         }
         self.session = aiohttp.ClientSession()
 
@@ -74,11 +43,17 @@ class NutritionMapper:
         try:
             self.redis.ping()
         except RedisConnectionError:
-            logging.warning("Warning: Redis connection failed. Using in-memory cache only")
+            logging.warning("Warning: Redis connection failed. Using in-memory cache")
+            self.redis=None
+        except Exception as e:
+            logging.error(f"Unexpected Redis error: {e}")
             self.redis=None
     async def close(self):
         await self.session.close()
-
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
     async def get_nutrition_data(self, query: str, max_results: int = 1) -> Optional[Dict]:
         """Async version of the USDA API call with Redis caching"""
         cache_key = f"nutrition:{query.lower()}"
@@ -110,6 +85,35 @@ class NutritionMapper:
                     self._cache_data(cache_key, nutrition)
                     return nutrition
               return None
+
+    def _validate_nutrition_values(self, nutrition: Dict) -> Dict:
+        """Validate and clean nutrition values"""
+        cleaned = {}
+        for key, value in nutrition.items():
+            try:
+                cleaned[key] = float(value)
+                if cleaned[key] < 0:
+                    cleaned[key] = 0
+                    logging.warning(f"Negative value found for {key}, set to 0")
+            except (ValueError, TypeError):
+                logging.warning(f"Invalid value for {key}: {value}")
+                cleaned[key] = 0
+        return cleaned
+
+    async def _api_call_with_retry(self, url: str, params: Dict, max_retries: int = 3):
+        for attempt in range(max_retries):
+            try:
+                async with self.session.get(url, params=params) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    elif response.status == 429:  # Rate limit
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(2 ** attempt)
+        return None
 
     def _parse_nutrition_data(self, food_item: Dict) -> Dict:
         """Parse nutrition data from USDA API response"""

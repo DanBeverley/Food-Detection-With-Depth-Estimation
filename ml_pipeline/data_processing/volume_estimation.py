@@ -1,3 +1,4 @@
+import logging
 import os
 import cv2
 import numpy as np
@@ -6,7 +7,7 @@ import torch.nn.functional as F
 from torchvision.ops import box_convert
 from PIL import Image
 from scipy.spatial import ConvexHull
-
+from functools import lru_cache
 from shape_mapping import ShapePrior
 
 
@@ -29,12 +30,16 @@ class HybridPortionEstimator:
         try:
             # Load reference object detector (YOLOv8)
             self.ref_detector = torch.hub.load('ultralytics/yolov8', 'yolov8n', pretrained=True)
-
+        except Exception as e:
+            logging.error(f"Failed to load YOLOv8: {e}")
+            raise RuntimeError("Reference detector loading failed")
+        try:
             # Load MiDaS for depth estimation
             self.midas = torch.hub.load('intel-isl/MiDaS', 'MiDaS_small').to(self.device)
             self.midas_transform = torch.hub.load('intel-isl/MiDaS', 'transforms').small_transform
         except Exception as e:
-            raise RuntimeError(f"Model loading failed: {e}")
+            logging.errors(f"Failed to load MiDaS: {e}")
+            raise RuntimeError("Depth estimation model loading failed")
     def get_scale(self, image):
         """
         Compute the pixel-to-centimeter scale factor for an image.
@@ -163,17 +168,19 @@ class HybridPortionEstimator:
         }
         physical_size = reference_sizes.get(best_ref["label"], known_width_cm)
         return physical_size/ref_width
-
-    def _get_depth_map(self, image):
+    @lru_cache(maxsize=32)
+    def _get_depth_map(self, image_hash):
         """Get depth map using MiDaS"""
-        input_tensor = self.midas_transform(Image.fromarray(image)).to(self.device)
-        with torch.no_grad():
-            prediction = self.midas(input_tensor.unsqueeze(0))
-            prediction = F.interpolate(prediction.unsqueeze(1),
-                                       size = image.shape[:2],
-                                       mode = "bicubic",
-                                       align_corners = False,)
-        return prediction.squeeze().cpu().numpy()
+        return self.midas(image_hash)
+
+    def _calculate_volume_confidence(self, depth_quality:float, mask_quality:float,
+                                     reference_confidence:float)->float:
+        """Calculate overall confidence score for volume estimation"""
+        weights = {"depth":0.4, "mask":0.4, "reference":0.2}
+        confidence = (depth_quality * weights["depth"] +
+                      depth_quality * weights["mask"] +
+                      reference_confidence * weights["reference"])
+        return min(max(confidence, 0.0), 1.0)
 
     def _get_food_density(self, label):
         """Get density from database or nutrition mapper"""
@@ -370,19 +377,20 @@ class UECVolumeEstimator:
 
     def _assess_depth_quality(self, depth_map, mask):
         """Assess quality of depth map measurements"""
-        masked_depth = depth_map*mask
-        valid_depths = masked_depth[mask>0]
+        masked_depth = depth_map * mask
+        valid_depths = masked_depth[mask > 0]
 
-        if len(valid_depths)==0:
+        if len(valid_depths) == 0:
+            return 0.0
+        depth_mean = np.mean(valid_depths)
+        if depth_mean == 0:
             return 0.0
 
         # Check depth variance
         depth_std = np.std(valid_depths)
-        depth_mean = np.mean(valid_depths)
+        relative_std = depth_std/depth_mean
 
-        if depth_std/depth_mean>.5: # High variance
-            return 0.6
-        return 0.9
+        return 0.6 if relative_std > 0.5 else 0.9
 
 
 class UnifiedFoodEstimator:
