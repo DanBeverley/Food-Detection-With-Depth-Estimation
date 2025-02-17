@@ -39,9 +39,12 @@ class MultiTaskFoodNet(nn.Module):
             shared = self.shared_fc(features)
             # Scale outputs to realistic ranges
             nutrition = self.nutrition_head(shared)
-            nutrition[:,0] *= self.calories_scale
-            nutrition[:,1] *= self.protein_scale
-
+            nutrition = torch.stack([
+                nutrition[:, 0] * self.calories_scale,
+                nutrition[:, 1] * self.protein_scale,
+                nutrition[:, 2],
+                nutrition[:, 3]
+            ], dim = 1)
             return {"class":self.class_head(shared),
                     "nutrition":nutrition}
         except RuntimeError as e:

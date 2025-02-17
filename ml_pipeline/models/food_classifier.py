@@ -53,6 +53,8 @@ class FoodClassifier:
             device: Device to run model on
         """
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type=="cuda"))
+
         self.num_classes = num_classes
 
         # Initialize model
@@ -68,7 +70,7 @@ class FoodClassifier:
         self.active_learner = active_learner
         self.unlabeled_pool = []
         self.label_smoothing = label_smoothing
-        self.model = self.model.to(device)
+        self.model = self.model.to(self.device)
 
         # Setup image preprocessing
         self.transform = transforms.Compose([transforms.Resize(256),
@@ -87,10 +89,12 @@ class FoodClassifier:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         # Validate numpy array input
         elif isinstance(image, np.ndarray):
-             if image.ndim != 3 or image.shape[2] != 3:
+            if image.shape[2] == 3:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            if image.ndim != 3 or image.shape[2] != 3:
                  raise ValueError(f"Invalid image shape: {image.shape}"
                                   "Expected (H, W, 3) RGB array")
-             if image.dtype != np.uint8:
+            if image.dtype != np.uint8:
                  raise ValueError(f"Invalid dtype: {image.shape}"
                                   "Expected uint8 (0-255 range)")
         else:
@@ -154,6 +158,9 @@ class FoodClassifier:
         # 4. Retrain
         self.train(self.active_learner.train_loader, self.active_learner.val_loader)
 
+        if not self.active_learner:
+            raise ValueError("Active learner not initialized")
+
     def quantize(self):
         self.model = quantize_dynamic(self.model.to("cpu"),
                                       {nn.Linear, nn.Conv2d},
@@ -198,7 +205,6 @@ class FoodClassifier:
             print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%")
 
     def _train_epoch(self, train_loader, optimizer, class_criterion, nutrition_criterion):
-        scaler = GradScaler()
         self.model.train()
         total_loss = 0
 
@@ -212,9 +218,9 @@ class FoodClassifier:
                 outputs = self.model(images)
                 loss = (0.7 * class_criterion(outputs["class"], labels) +
                         0.3 * nutrition_criterion(outputs["nutrition"], nutrition))
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(optimizer)
+            self.scaler.update()
 
             total_loss += loss.item()
 

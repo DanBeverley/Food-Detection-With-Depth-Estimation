@@ -37,7 +37,7 @@ class FoodGANDataset(Dataset):
     def __getitem__(self, idx):
         img = cv2.imread(self.image_paths[idx])
         mask = cv2.imread(self.mask_paths[self.image_paths[idx].stem])
-        return self.transform(image=img, mask = mask)
+        return self.transform(image=np.array(img), mask = np.array(mask))
 
 class Generator(nn.Module):
     def __init__(self, nz:int=100, ngf:int=64, nc:int=3):

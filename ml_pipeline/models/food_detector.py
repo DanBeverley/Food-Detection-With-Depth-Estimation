@@ -65,6 +65,11 @@ class FoodDetector:
 
     def preprocess_image(self, image:torch.Tensor):
         """Preprocess image for YOLO model"""
+        if isinstance(image, np.ndarray):
+            if image.dtype != np.uint8:
+                raise ValueError(f"Invalid dtype: {image.dtype}, expected uint8")
+            if image.max() > 255 or image.min() < 0:
+                raise ValueError("Image values out of [0, 255] range")
         if isinstance(image, str):
             image = cv2.imread(image)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -78,7 +83,7 @@ class FoodDetector:
 
     def build_trt_engine(self, output_path="yolov8.trt"):
         """Export YOLOv8 to TensorRT engine with proper optimization"""
-        ModelOptimizer.export_tensorrt(self.model, output_path=self.trt_engine)
+        ModelOptimizer.export_tensorrt(self.model, output_path=output_path)
 
     def _preprocess(self, image):
         """Preprocess image for TensorRT inference"""

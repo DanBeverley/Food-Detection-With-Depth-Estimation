@@ -15,7 +15,7 @@ def create_multitask_head(in_features):
         nn.Sigmoid()
     )
 
-def get_feature_dim(backbone, input_size=(3, 256, 256)):
+def get_feature_dim(backbone, input_size=(3, 224, 224)):
     with torch.no_grad():
         dummy_input = torch.randn(1, *input_size)
         features = backbone(dummy_input)
