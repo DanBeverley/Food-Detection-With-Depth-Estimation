@@ -1,0 +1,27 @@
+system:
+  log_level: INFO
+  device: cuda:0
+  seed: 42
+
+paths:
+  dataset: /data/uec256
+  test_images: /data/test_images
+  models:
+    detector: models/yolov8n_food.pt
+    classifier: models/multitask_foodnet.pth
+
+training:
+  batch_size: 32
+  epochs: 100
+  learning_rate: 0.001
+  image_size: 640
+
+logging:
+  file: logs/pipeline.log
+  rotation: daily
+  level: DEBUG
+
+tensorrt:
+  enabled: true
+  precision: FP16
+  workspace_size: 4096
