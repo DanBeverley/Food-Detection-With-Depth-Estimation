@@ -10,9 +10,9 @@ from ml_pipeline.models.food_detector import FoodDetector
 
 
 class FoodTrainingSystem:
-    def __init__(self, config:dict):
-        self.config = self._validate_config(config)
-        self.device = torch.device(config["device"])
+    def __init__(self, cfg:dict):
+        self.config = self._validate_config(cfg = cfg)
+        self.device = torch.device(cfg["device"])
 
         self._setup_logging()
 
@@ -48,11 +48,11 @@ class FoodTrainingSystem:
         self.logger = logging.getLogger(__name__)
 
     @staticmethod
-    def _validate_config(self, config: dict) -> dict:
+    def _validate_config(self, cfg: dict) -> dict:
         """Validate and set default configuration values"""
         required_keys = ["data_root", "usda_key"]
         for key in required_keys:
-            if key not in config:
+            if key not in cfg:
                 raise ValueError(f"Missing required configuration key: {key}")
         defaults = {
             "batch_size": 32,
@@ -68,7 +68,7 @@ class FoodTrainingSystem:
             "num_workers":os.cpu_count(),
             "train_val_split":0.8
         }
-        return {**defaults, **config}
+        return {**defaults, **cfg}
 
     def _init_components(self):
         """Initialize all model components"""
@@ -142,8 +142,8 @@ class FoodTrainingSystem:
         total_loss = 0
         num_batches = len(self.train_loader)
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
-        for batch_idx, (images, targets) in enumerate(progress_bar):
-            loss = self._train_step(images, targets, batch_idx,  epoch)
+        for batch_idx, (val_images, val_targets) in enumerate(progress_bar):
+            loss = self._train_step(val_images, val_targets, batch_idx,  epoch)
             total_loss += loss
 
             progress_bar.set_postfix({"loss":f"{loss:.4f}"})
@@ -154,9 +154,9 @@ class FoodTrainingSystem:
                                  f"LR: {self.optimizer.param_groups[0]['lr']:.6f}")
         return total_loss/num_batches
 
-    def _train_step(self, images, targets, batch_idx: int, epoch: int) -> float:
+    def _train_step(self, val_images, val_targets, batch_idx: int, epoch: int) -> float:
         """Single training step"""
-        images = images.to(self.device, non_blocking=True)
+        val_images = val_images.to(self.device, non_blocking=True)
 
         # QAT handling
         if self._should_start_qat(epoch):
@@ -167,7 +167,7 @@ class FoodTrainingSystem:
 
         # Mixed precision training
         with autocast(enabled=self.config["mixed_precision"]):
-            loss = self._forward_pass(images, targets)
+            loss = self._forward_pass(val_images, val_targets)
 
             # Scale loss for gradient accumulations
             if self.config["accumulation_steps"]>1:
@@ -198,18 +198,18 @@ class FoodTrainingSystem:
 
     def _get_trainable_parameters(self):
         return list(self.classifier.model.parameters()) + list(self.detector.model.parameters())
-    def _forward_pass(self, images, targets):
+    def _forward_pass(self, val_images, val_targets):
         """Forward pass through both models"""
-        detections = self.detector.detect(images, return_masks=True)
-        class_outputs = self.classifier.model(images)
+        detections = self.detector.detect(val_images, return_masks=True)
+        class_outputs = self.classifier.model(val_images)
 
         return self._calculate_loss(
             class_outputs,
-            targets,
+            val_targets,
             detections
         )
 
-    def _calculate_loss(self, outputs, targets, detections) -> int:
+    def _calculate_loss(self, outputs, val_targets, detections) -> float:
         """Calculate combined loss"""
         weights = self.config.get("loss_weights", {
             "classification": 1.0,
@@ -220,15 +220,15 @@ class FoodTrainingSystem:
         losses = {
             "classification": F.cross_entropy(
                 outputs["class"],
-                targets["labels"]
+                val_targets["labels"]
             ),
             "nutrition": F.mse_loss(
                 outputs["nutrition"],
-                targets["nutrition"]
+                val_targets["nutrition"]
             ),
             "portion": F.l1_loss(
                 outputs["portions"],
-                targets["portions"]
+                val_targets["portions"]
             )
         }
 
@@ -281,14 +281,17 @@ class FoodTrainingSystem:
     def validate(self):
         self.classifier.model.eval()
         self.detector.model.eval()
-        total_loss = 0
+        total_loss = 0.0
         with torch.no_grad(), autocast(enabled=self.config["mixed_precision"]):
-            for images, targets in self.val_loader:
-                images = images.to(self.device)
+            for val_images, val_targets in self.val_loader:
+                val_images = val_images.to(self.device)
                 with autocast(enabled=self.config["mixed_precision"]):
-                    loss = self._forward_pass(images, targets)
-                total_loss += loss.item()
-        return total_loss/len(self.val_loader)
+                    loss_tensor = self._forward_pass(val_images, val_targets)
+                if isinstance(loss_tensor, torch.Tensor):
+                    total_loss += loss_tensor.item()
+                else:
+                    raise TypeError(f"Unexpected loss type: {type(loss_tensor)}")
+        return total_loss / len(self.val_loader)
 
     def _handle_validation_results(self, train_loss: float, val_loss: float) -> bool:
         """Handle validation results and early stopping"""
@@ -317,6 +320,18 @@ class FoodTrainingSystem:
         "best_val_loss": self.best_val_loss}
         torch.save(checkpoint, f"{name}_checkpoint.pth")
         self.logger.info(f"Saved checkpoint: {name}_checkpoint.pth")
+
+    def _load_checkpoint(self, path:str):
+        """Load training state from checkpoint"""
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Checkpoint {path} not found")
+        checkpoint = torch.load(path, map_location=self.device)
+        self.classifier.model.load_state_dict(checkpoint["classifier"])
+        self.detector.model.load_state_dict(checkpoint["detector"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.scaler.load_state_dict(checkpoint["scaler"])
+        self.best_val_loss = checkpoint["best_val_loss"]
+        self.current_epoch = checkpoint["epoch"]
 
     def _should_export_trt(self, epoch: int) -> bool:
         """Check if TensorRT export should be performed"""

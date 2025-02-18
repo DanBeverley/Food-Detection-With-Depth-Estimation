@@ -1,5 +1,6 @@
+import collections
 import os
-from typing import Callable
+from typing import Callable, Any
 from shape_mapping import UEC256ShapeMapper
 
 import cv2
@@ -8,9 +9,7 @@ from collections import defaultdict
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-
-import asyncio
-from typing import Dict, Any
+from typing import Dict
 from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
 from concurrent.futures import ThreadPoolExecutor
 
@@ -18,7 +17,9 @@ from pathlib import Path
 import logging
 
 class UECFoodDataset(Dataset):
-    def __init__(self, root_dir:str, transform:Callable=None, image_ext:str=".jpg", nutrition_mapper=None):
+    def __init__(self, root_dir:str,
+                 transform:Callable=None, image_ext:str=".jpg",
+                 nutrition_mapper=None):
         """
         Args:
             root_dir (str): Root directory containing subfolders for each food category.
@@ -80,10 +81,10 @@ class UECFoodDataset(Dataset):
             except Exception as e:
                 logging.error(f"Error validating nutrition for {food_name}: {e}")
 
-    def process_batch(self, indices):
+    def process_batch(self, indices:collections.Iterable) -> list:
         return [self.__getitem__(i) for i in indices]
 
-    def _read_category_file(self):
+    def _read_category_file(self) -> Any:
         categories_file = os.path.join(self.root_dir, "category.txt")
         if os.path.exists(categories_file):
             with open(categories_file, "r") as f:
@@ -106,7 +107,7 @@ class UECFoodDataset(Dataset):
             logging.warning(f"⚠️ Warning: category.txt not found in the root directory.")
             self.id_to_category = None
 
-    def _load_dataset(self):
+    def _load_dataset(self) -> Any:
         for category in sorted(os.listdir(self.root_dir)):
             category_path = os.path.join(self.root_dir, category)
             if not os.path.isdir(category_path):
@@ -115,7 +116,7 @@ class UECFoodDataset(Dataset):
                 label = int(category)
             except ValueError:
                 logging.warning(f"⚠️ Warning: Folder name '{category} is not numeric . Skipping...'")
-
+                continue
             # The annotation file in the folder
             bb_info_file = os.path.join(category_path, "bb_info.txt")
             if not os.path.exists(bb_info_file):
@@ -150,10 +151,11 @@ class UECFoodDataset(Dataset):
                 self.data.append({"image_path":image_path,
                                   "bboxes":bboxes,
                                   "label":label})
-    def __len__(self):
+
+    def __len__(self) -> int:
         return len(self.data)
-    def __getitem__(self, idx):
-        item = self.data[idx]
+    def __getitem__(self, idx:int):
+        item:dict = self.data[idx]
 
         # Mask loading verification
         mask_path = Path(item["image_path"]).with_suffix(".png")
@@ -217,6 +219,7 @@ class UECFoodDataset(Dataset):
                 portion = self._estimate_portion(food_name, mask_area)
             else:   # Fallback to bbox area
                 # Calculate area based portion estimation
+                x1, y1, x2, y2 = bboxes[0]
                 bbox_area = (x2-x1)*(y2-y1)
                 portion =  self._estimate_portion(food_name, bbox_area)
 
@@ -239,28 +242,29 @@ class UECFoodDataset(Dataset):
         return image, target
 
 
-    def _estimate_portion(self, food_name:str, bbox_area:float):
+    def _estimate_portion(self, food_name:str, bbox_area:float) -> float:
         """Estimate portion (volume in ml) using food-specific density per pixel area"""
         # density = self.nutrition_mapper.get_density(food_name) # g/pixel_area
         shape_prior = self.shape_mapper.get_shape_prior(food_name)
         # Example : Dome shape food volume = area^(3/2) * height_ratio
         volume = (bbox_area**1.5)*shape_prior.height_ratio
         return volume*shape_prior.volume_modifier
+
 # Custom Collate Function
-def collate_fn(batch):
-    images = []
+def collate_fn(batch:collections.Iterable) -> tuple:
+    image = []
     detection_targets = []
     nutrition_targets = []
     for img, target in batch:
-        images.append(img)
+        image.append(img)
         # Combine labels and boxes into [class_id, x, y, w, h]
         yolotarget = torch.cat([target["labels"].unsqueeze(1),
                                 target["boxes"],
                                 target.get("portion", torch.zeros(1).unsqueeze(1))], dim = 1)
         detection_targets.append(yolotarget)
         nutrition_targets.append(target["nutrition"])
-    images = torch.stack(images, dim = 0)
-    return (images, {"detection":detection_targets,
+    image = torch.stack(image, dim = 0)
+    return (image, {"detection":detection_targets,
                      "nutrition":torch.stack(nutrition_targets,0)})
 
 

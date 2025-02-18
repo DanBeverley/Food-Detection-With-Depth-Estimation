@@ -8,8 +8,7 @@ import numpy as np
 from torch import nn
 import torch.nn.functional as F
 import torch.cuda
-from torch.cuda.amp import GradScaler
-from torch.utils.data import ConcatDataset, DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset, Dataset
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
 from torchvision.datasets import ImageFolder
