@@ -176,7 +176,8 @@ class FoodClassifier:
         """
         if self.active_learner:
             train_loader = DataLoader(self.active_learner.current_dataset,
-                                      batch_size = 32, shuffle=True, pin_memory=True)
+                                      batch_size = 32, shuffle=True, pin_memory=True,
+                                      persistent_workers=True)
         class_criterion = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
         nutrition_criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)

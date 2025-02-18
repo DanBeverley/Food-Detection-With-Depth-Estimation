@@ -269,11 +269,11 @@ train_dataset = UECFoodDataset(root_dir = dataset_root, transform = get_train_tr
 val_dataset = UECFoodDataset(root_dir = dataset_root, transform = get_val_transforms())
 train_loader = DataLoader(train_dataset, batch_size = 32,
                            shuffle = True, num_workers = 4,
-                           pin_memory=True, collate_fn=collate_fn)
+                           pin_memory=True, collate_fn=collate_fn, persistent_workers=True)
 
 val_loader = DataLoader(val_dataset, batch_size=32,
                         shuffle = False, num_workers = 4,
-                        pin_memory = True, collate_fn = collate_fn)
+                        pin_memory = True, collate_fn = collate_fn, persistent_workers=True)
 
 # Quick test: Retrieve one batch from the training loader.
 images, targets = next(iter(train_loader))
