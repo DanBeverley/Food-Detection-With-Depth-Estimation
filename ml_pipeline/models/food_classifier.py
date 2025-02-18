@@ -108,6 +108,14 @@ class FoodClassifier:
             )
         return tensor.to(self.device)
 
+    def prepare_for_qat(self):
+        """Modify model for quantization-aware training"""
+        from pytorch_quantization import quant_modules
+        quant_modules.initialize()
+
+        # Replace layers with quantized versions
+        self.model = quant_modules.quantize_model(self.model)
+
     def classify_crop(self, image, bbox):
         """
         Classify a cropped region of an image

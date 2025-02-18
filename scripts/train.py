@@ -1,5 +1,10 @@
+import asyncio
 import torch.nn.functional as F
+import torch.utils.data
+from torch import nn
 from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
+
 from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
 from ml_pipeline.data_processing.dataset_loader import *
 from ml_pipeline.models.food_detector import FoodDetector
@@ -11,6 +16,8 @@ class FoodTrainingSystem:
         self.config = self._validate_config(config)
         self.device = torch.device(config["device"])
 
+        self._setup_logging()
+
         # Initialize components
         self._init_components()
         self._init_optimization()
@@ -20,16 +27,37 @@ class FoodTrainingSystem:
         self.best_val_loss = float('inf')
         self.early_stopping_counter = 0
 
+    def _setup_logging(self):
+        """Initialize logging configuration"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('training.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
     def _validate_config(self, config: dict) -> dict:
         """Validate and set default configuration values"""
+        required_keys = ["data_root", "usda_key"]
+        for key in required_keys:
+            if key not in config:
+                raise ValueError(f"Missing required configuration key: {key}")
         defaults = {
             "batch_size": 32,
             "epochs": 100,
             "lr": 3e-4,
             "mixed_precision": True,
             "early_stopping_patience": 10,
+            "qat_enabled":False,
             "qat_start_epoch": 5,
             "trt_validation_freq": 10,
+            "gradient_clip_val":1.0,
+            "accumulation_steps":1,
+            "num_workers":os.cpu_count(),
+            "train_val_split":0.8
         }
         return {**defaults, **config}
 
@@ -42,14 +70,36 @@ class FoodTrainingSystem:
             transform=get_train_transforms(),
             nutrition_mapper=self.nutrition_mapper
         )
+        # Create train/val split
+        train_size = int(0.8 * len(self.dataset))
+        val_size = len(self.dataset) - train_size
+        self.train_dataset, self.val_dataset = torch.utils.data.random_split(
+            self.dataset, [train_size, val_size]
+        )
+
+        # Initialize dataloaders
+        self.train_loader = torch.utils.data.DataLoader(self.train_dataset,
+                                                        batch_size=self.config["batch_size"],
+                                                        shuffle=True,
+                                                        num_workers=self.config.get("num_workers",4),
+                                                        persistent_workers=True,
+                                                        pin_memory=True if self.device.type == "cuda" else False,
+                                                        drop_last=True)
+
+        self.val_loader = torch.utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=self.config["batch_size"],
+            shuffle=False,
+            num_workers=self.config.get("num_workers", 4),
+            pin_memory=True if self.device.type == "cuda" else False
+        )
 
         # Models
         self.detector = FoodDetector(
             quantized=self.config["quantize"],
             device=self.device
         )
-
-        self.classifier = FoodClassifier(
+        self.classifier= FoodClassifier(
             num_classes=256,
             active_learner=ActiveLearner(
                 self.dataset,
@@ -76,20 +126,26 @@ class FoodTrainingSystem:
             self.optimizer, mode='min', patience=5, factor=0.5
         )
 
-    async def train_epoch(self, epoch):
+    def train_epoch(self, epoch:int)->float:
         """Training for one epoch"""
         self.classifier.model.train()
         self.detector.model.train()
         total_loss = 0
-        for batch_idx, (images, targets) in enumerate(self.train_loader):
-            loss = await self._train_step(images, targets, batch_idx, epoch)
+        num_batches = len(self.train_loader)
+        progress_bar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
+        for batch_idx, (images, targets) in enumerate(progress_bar):
+            loss = self._train_step(images, targets, batch_idx, 50)
             total_loss += loss
 
+            progress_bar.set_postfix({"loss":f"{loss:.4f}"})
             if batch_idx % 10 == 0:
-                self._log_progress(epoch, batch_idx, loss)
-        return total_loss/len(self.train_loader)
+                self.logger.info(f"Epoch: {self.current_epoch} | "
+                                 f"Batch: [{batch_idx}/{num_batches}] | "
+                                 f"Loss: {loss:.4f} |"
+                                 f"LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+        return total_loss/num_batches
 
-    async def _train_step(self, images, targets, batch_idx: int, epoch: int) -> float:
+    def _train_step(self, images, targets, batch_idx: int, epoch: int) -> float:
         """Single training step"""
         images = images.to(self.device, non_blocking=True)
 
@@ -97,22 +153,42 @@ class FoodTrainingSystem:
         if self._should_start_qat(epoch):
             self._initialize_qat()
 
+        # Accumulation steps for larger effective batch size
+        is_accumulation_step = (batch_idx + 1) % self.config["accumulation_steps"]
+
         # Mixed precision training
         with autocast(enabled=self.config["mixed_precision"]):
             loss = self._forward_pass(images, targets)
 
-        # Optimization
-        self.optimizer.zero_grad()
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+            # Scale loss for gradient accumulations
+            if self.config["accumulation_steps"]>1:
+                loss = loss/self.config["accumulation_steps"]
 
+        # Backward pass with gradient scaling
+        self.scaler.scale(loss).backward()
+
+        if not is_accumulation_step:
+            # Gradient clipping
+            if self.config["gradient_clip_val"]>0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm(
+                    self._get_trainable_parameters(),
+                    self.config["gradient_clip_val"]
+                )
+
+            # Optimization
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
         # Active learning
         if self.config.get("active_learning") and batch_idx % 100 == 0:
-            await self._active_learning_step()
+            self._active_learning_step()
 
         return loss.item()
 
+    def _get_trainable_parameters(self):
+        return list(self.classifier.model.parameters()) + list(self.detector.model.parameters())
     def _forward_pass(self, images, targets) -> torch.Tensor:
         """Forward pass through both models"""
         detections = self.detector.detect(images, return_masks=True)
@@ -164,29 +240,46 @@ class FoodTrainingSystem:
         self.detector.calibrate_model(self.val_loader)
         self.quat_initialized = True
 
-    async def run_training(self):
+    def run_training(self):
         """Main training loop"""
-        await self.initialize()
+        self.initialize()
+        try:
+            for epoch in range(self.config["epochs"]):
+                self.current_epoch = epoch
 
-        for epoch in range(self.config["epochs"]):
-            self.current_epoch = epoch
+                # Training
+                train_loss = self.train_epoch(epoch)
 
-            # Training
-            train_loss = await self.train_epoch(epoch)
+                # Validation
+                val_loss = self.validate()
 
-            # Validation
-            val_loss = self.validate()
+                # Learning rate scheduling
+                self.scheduler.step(val_loss)
 
-            # Learning rate scheduling
-            self.scheduler.step(val_loss)
+                # Model saving and early stopping
+                if self._handle_validation_results(train_loss, val_loss):
+                    break
 
-            # Model saving and early stopping
-            if self._handle_validation_results(train_loss, val_loss):
-                break
+                # TensorRT export
+                if self._should_export_trt(epoch):
+                    self._export_trt_checkpoint(epoch)
+        except Exception as e:
+            self.logger.error(f"Training failed: {str(e)}")
+            raise
+        finally:
+            self.logger.info("Training completed")
 
-            # TensorRT export
-            if self._should_export_trt(epoch):
-                self._export_trt_checkpoint(epoch)
+    def validate(self):
+        self.classifier.model.eval()
+        self.detector.model.eval()
+        total_loss = 0
+        with torch.no_grad(), autocast(enabled=self.config["mixed_precision"]):
+            for images, targets in self.val_loader:
+                images = images.to(self.device)
+                with autocast(enabled=self.config["mixed_precision"]):
+                    loss = self._forward_pass(images, targets)
+                total_loss += loss.item()
+        return total_loss/len(self.val_loader)
 
     def _handle_validation_results(self, train_loss: float, val_loss: float) -> bool:
         """Handle validation results and early stopping"""
@@ -213,6 +306,20 @@ class FoodTrainingSystem:
                 epoch % self.config["trt_validation_freq"] == 0
         )
 
+    def _export_trt_checkpoint(self, epoch:int):
+        from ml_pipeline.utils.optimization import ModelOptimizer
+        ModelOptimizer.export_tensorrt(self.detector.model, input_shape=(3, 640, 640),
+                                       output_path=f"detector_epoch_{epoch}.trt")
+        ModelOptimizer.export_tensorrt(self.classifier.model, input_shape=(3, 256, 256),
+                                       output_path=f"classifier_epoch_{epoch}.trt")
+
+    def _active_learning_step(self):
+        pool_loader = DataLoader(self.classifier.active_learner.unlabeled_pool, batch_size=32,
+                                 shuffle=True)
+        samples = self.classifier.get_uncertain_samples(pool_loader)
+        labeled_data = human_labeling_interface(samples)
+        self.classifier.active_learner.update_dataset(labeled_data)
+
 if __name__ == "__main__":
     config = {
         "trt_engine_path": "models/yolov8_food.trt",
@@ -230,6 +337,8 @@ if __name__ == "__main__":
             "portion": 0.2
         }
     }
-
     system = FoodTrainingSystem(config)
-    asyncio.run(system.run_training())
+    if torch.cuda.is_available():
+        asyncio.run(system.run_training())
+    else:
+        system.run_training()

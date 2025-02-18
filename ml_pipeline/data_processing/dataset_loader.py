@@ -192,7 +192,8 @@ class UECFoodDataset(Dataset):
             yolo_boxes.append([x_center, y_center, w, h])
 
         target = {"boxes":torch.tensor(yolo_boxes, dtype = torch.float32), # Shape: [num_boxes,4]
-                  "labels":torch.tensor(labels, dtype = torch.int64)}  # Shape: [num_boxes]
+                  "labels":torch.tensor(labels, dtype = torch.int64),      # Shape: [num_boxes]
+                  }
 
         # Portion estimation calculations
         nutrition_data = torch.zeros(4, dtype=torch.float32) # [cal, prot, fat, carbs]
