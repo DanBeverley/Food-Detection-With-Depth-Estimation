@@ -1,14 +1,12 @@
-import asyncio
 import torch.nn.functional as F
 import torch.utils.data
-from torch import nn
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
-from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
 from ml_pipeline.data_processing.dataset_loader import *
-from ml_pipeline.models.food_detector import FoodDetector
+from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
 from ml_pipeline.models.food_classifier import FoodClassifier, ActiveLearner, human_labeling_interface
+from ml_pipeline.models.food_detector import FoodDetector
 
 
 class FoodTrainingSystem:
@@ -27,6 +25,16 @@ class FoodTrainingSystem:
         self.best_val_loss = float('inf')
         self.early_stopping_counter = 0
 
+    def initialize(self):
+        """Final initialization before training"""
+        # Move models to device
+        self.classifier.model.to(self.device)
+        self.detector.model.to(self.device)
+
+        # Load checkpoints if resuming
+        if self.config.get("resume_from"):
+            self._load_checkpoint(self.config["resume_from"])
+
     def _setup_logging(self):
         """Initialize logging configuration"""
         logging.basicConfig(
@@ -39,6 +47,7 @@ class FoodTrainingSystem:
         )
         self.logger = logging.getLogger(__name__)
 
+    @staticmethod
     def _validate_config(self, config: dict) -> dict:
         """Validate and set default configuration values"""
         required_keys = ["data_root", "usda_key"]
@@ -134,7 +143,7 @@ class FoodTrainingSystem:
         num_batches = len(self.train_loader)
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
         for batch_idx, (images, targets) in enumerate(progress_bar):
-            loss = self._train_step(images, targets, batch_idx, 50)
+            loss = self._train_step(images, targets, batch_idx,  epoch)
             total_loss += loss
 
             progress_bar.set_postfix({"loss":f"{loss:.4f}"})
@@ -189,7 +198,7 @@ class FoodTrainingSystem:
 
     def _get_trainable_parameters(self):
         return list(self.classifier.model.parameters()) + list(self.detector.model.parameters())
-    def _forward_pass(self, images, targets) -> torch.Tensor:
+    def _forward_pass(self, images, targets):
         """Forward pass through both models"""
         detections = self.detector.detect(images, return_masks=True)
         class_outputs = self.classifier.model(images)
@@ -200,7 +209,7 @@ class FoodTrainingSystem:
             detections
         )
 
-    def _calculate_loss(self, outputs, targets, detections) -> torch.Tensor:
+    def _calculate_loss(self, outputs, targets, detections) -> int:
         """Calculate combined loss"""
         weights = self.config.get("loss_weights", {
             "classification": 1.0,
@@ -299,6 +308,16 @@ class FoodTrainingSystem:
 
         return False
 
+    def _save_checkpoint(self, name:str):
+        """Save model state"""
+        checkpoint = {"epoch": self.current_epoch,
+        "classifier": self.classifier.model.state_dict(),
+        "detector": self.detector.model.state_dict(),
+        "optimizer": self.optimizer.state_dict(),
+        "best_val_loss": self.best_val_loss}
+        torch.save(checkpoint, f"{name}_checkpoint.pth")
+        self.logger.info(f"Saved checkpoint: {name}_checkpoint.pth")
+
     def _should_export_trt(self, epoch: int) -> bool:
         """Check if TensorRT export should be performed"""
         return (
@@ -315,7 +334,8 @@ class FoodTrainingSystem:
 
     def _active_learning_step(self):
         pool_loader = DataLoader(self.classifier.active_learner.unlabeled_pool, batch_size=32,
-                                 shuffle=True)
+                                 num_workers = self.config["num_workers"], shuffle=True,
+                                 pin_memory=True)
         samples = self.classifier.get_uncertain_samples(pool_loader)
         labeled_data = human_labeling_interface(samples)
         self.classifier.active_learner.update_dataset(labeled_data)
