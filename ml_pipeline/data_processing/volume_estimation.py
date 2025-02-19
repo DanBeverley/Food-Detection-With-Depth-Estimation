@@ -3,9 +3,7 @@ import os
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torchvision.ops import box_convert
-from PIL import Image
 from scipy.spatial import ConvexHull
 from functools import lru_cache
 from shape_mapping import ShapePrior
@@ -38,7 +36,7 @@ class HybridPortionEstimator:
             self.midas = torch.hub.load('intel-isl/MiDaS', 'MiDaS_small').to(self.device)
             self.midas_transform = torch.hub.load('intel-isl/MiDaS', 'transforms').small_transform
         except Exception as e:
-            logging.errors(f"Failed to load MiDaS: {e}")
+            logging.error(f"Failed to load MiDaS: {e}")
             raise RuntimeError("Depth estimation model loading failed")
     def get_scale(self, image):
         """
@@ -50,8 +48,8 @@ class HybridPortionEstimator:
         ref_objects = self._detect_reference_objects(img_rgb)
         scale_ratio = self._calculate_scale(ref_objects, known_width_cm=8.5)
         return scale_ratio
-
-    def _get_region_depth(self, depth_map, mask, box=None):
+    @staticmethod
+    def _get_region_depth(depth_map, mask, box=None):
         """Get average depth in masked region"""
         if mask is not None:
             valid_depths = depth_map[mask]
@@ -127,7 +125,8 @@ class HybridPortionEstimator:
                 ref_objects.append({'box':box,'label':label,'confidence':conf})
         return ref_objects
 
-    def _calculate_scale(self, ref_objects, known_width_cm):
+    @staticmethod
+    def _calculate_scale(ref_objects, known_width_cm):
         """calculate scale using best reference object"""
         if not ref_objects:
             return 0.1 # Fallback default
@@ -174,7 +173,8 @@ class HybridPortionEstimator:
         image_hash = hash(image.tobytes())
         return self.midas(image_hash)
 
-    def _calculate_volume_confidence(self, depth_quality:float, mask_quality:float,
+    @staticmethod
+    def _calculate_volume_confidence(depth_quality:float, mask_quality:float,
                                      reference_confidence:float)->float:
         """Calculate overall confidence score for volume estimation"""
         weights = {"depth":0.4, "mask":0.4, "reference":0.2}
@@ -202,7 +202,8 @@ class HybridPortionEstimator:
 class UECVolumeEstimator:
     def __init__(self, food_shape_priors = None):
         self.food_shape_priors = food_shape_priors or self._get_default_shape_prior()
-    def _get_default_shape_prior(self):
+    @staticmethod
+    def _get_default_shape_prior():
         """Define shape priors for common UEC-256 food categories
         Based on typical geometrical shapes of Japanese foods"""
         return {
@@ -262,8 +263,8 @@ class UECVolumeEstimator:
         confidence = self._calculate_confidence(mask, depth_map, shape_prior)
 
         return volume, confidence
-
-    def _estimate_dome_volume(self, depth_map, mask, area_cm2, prior):
+    @staticmethod
+    def _estimate_dome_volume(depth_map, mask, area_cm2, prior):
         """
         Estimate volume for dome-shaped foods (e.g., rice portions)
         """
@@ -275,8 +276,8 @@ class UECVolumeEstimator:
         height = max_height*prior["height_ratio"]
         volume = (1/6)*np.pi*height*(3*radius**2+height**2)
         return volume*prior.volume_modifier
-
-    def _estimate_bowl_content_volume(self, depth_map, mask, area_cm2, prior):
+    @staticmethod
+    def _estimate_bowl_content_volume(depth_map, mask, area_cm2, prior):
         """Estimate volume for food served in bowls"""
         masked_depth = depth_map*mask
         mean_depth = np.mean(masked_depth[mask>0])
@@ -300,7 +301,7 @@ class UECVolumeEstimator:
         # Use height from prior
         height = 2*radius*prior["height_ratio"]
         return np.pi*(radius**2)*height
-
+    @staticmethod
     def _estimate_irregular_volume(self, depth_map:np.ndarray, mask:np.ndarray,
                                    area_cm2: float, prior:ShapePrior,
                                    pixel_scale:float) -> float:
@@ -333,8 +334,8 @@ class UECVolumeEstimator:
 
         # Apply shape-specific modifier from prior
         return volume_cm3 * prior.volume_modifier
-
-    def _get_contours(self, mask):
+    @staticmethod
+    def _get_contours(mask):
         """Extract contours from binary mask"""
         mask_points = np.array(np.where(mask>0)).T
         if len(mask_points)<4:
@@ -357,9 +358,10 @@ class UECVolumeEstimator:
         # 3. Shape prior reliability
         shape_confidence = 0.9 if prior['shape'] != 'irregular' else 0.7
 
-        return (mask_quality * 0.4 + depth_quality * 0.4 + shape_confidence * 0.2)
+        return mask_quality * 0.4 + depth_quality * 0.4 + shape_confidence * 0.2
 
-    def _assess_mask_quality(self, mask):
+    @staticmethod
+    def _assess_mask_quality(mask):
         """Assess quality of segmentation mask"""
         if not mask.any():
             return 0.0
@@ -375,8 +377,8 @@ class UECVolumeEstimator:
         if num_features>3:
             return .7      # Multiple disconnected regions
         return .9
-
-    def _assess_depth_quality(self, depth_map, mask):
+    @staticmethod
+    def _assess_depth_quality(depth_map, mask):
         """Assess quality of depth map measurements"""
         masked_depth = depth_map * mask
         valid_depths = masked_depth[mask > 0]
@@ -399,8 +401,8 @@ class UnifiedFoodEstimator:
         self.hybrid_estimator = HybridPortionEstimator()
         self.uec_estimator = UECVolumeEstimator()
         self.food_category_map = self._load_uec_categories()
-
-    def _load_uec_categories(self):
+    @staticmethod
+    def _load_uec_categories():
         """
         Loads category mapping from a file (e.g., 'category.txt')
         If the file doesn't exist, a default mapping is used.
@@ -428,6 +430,7 @@ class UnifiedFoodEstimator:
     def estimate(self, image, detections):
         """Unified estimation pipeline
         Args:
+            image
             detections: List of dicts with keys:
                 - 'bbox': [x1,y1,x2,y2]
                 - 'label': category ID

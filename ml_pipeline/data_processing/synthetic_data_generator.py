@@ -34,8 +34,8 @@ class FoodGANDataset(Dataset):
     def __len__(self):
         return len(self.image_paths)
     def __getitem__(self, idx):
-        img = cv2.imread(self.image_paths[idx])
-        mask = cv2.imread(self.mask_paths[self.image_paths[idx].stem])
+        img = cv2.imread(str(self.image_paths[idx]))
+        mask = cv2.imread(str(self.mask_paths[self.image_paths[idx].stem]))
         return self.transform(image=np.array(img), mask = np.array(mask))
 
 class Generator(nn.Module):
@@ -61,7 +61,8 @@ class Generator(nn.Module):
             nn.Tanh()
         )
         self.apply(self._init_weight)
-    def _init_weight(self, m):
+    @staticmethod
+    def _init_weight(m):
         if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
             nn.init.normal_(m.weight, 0.0, 0.02)
         elif isinstance(m, nn.BatchNorm2d):
@@ -131,7 +132,7 @@ class GANTrainer:
         self.schedulerD = optim.lr_scheduler.ReduceLROnPlateau(self.optimD, "min", patience = 5)
 
         self._setup_logging()
-
+        self.fixed_noise = torch.randn(64, self.nz, 1, 1, device=self.device)
     def _setup_logging(self):
         """Initialize logging and checkpointing"""
         self.sample_dir = Path("gan_samples")
@@ -270,7 +271,7 @@ class GANTrainer:
         epoch_losses = {"G":0., "D":0.}
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{total_epochs}")
 
-        for batch_idx, real_imgs in enumerate(progress_bar):
+        for batch_idx, (index, real_imgs) in enumerate(progress_bar):
             losses = self._train_step(real_imgs.to(self.device))
             for k, v in losses.items():
                 epoch_losses[k] += v
