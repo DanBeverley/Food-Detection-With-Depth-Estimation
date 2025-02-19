@@ -1,14 +1,18 @@
 from pathlib import Path
+from typing import Any, Union, Iterable, Tuple, List, Optional, Dict, Callable
 
 import cv2
 
 from PIL import Image
 import numpy as np
 
-from torch import nn
+from torch import nn, Tensor
 import torch.nn.functional as F
 import torch.cuda
-from torch.utils.data import ConcatDataset, DataLoader, Subset, Dataset
+from ml_pipeline.data_processing.dataset_loader import UECFoodDataset
+from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
+
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
 from torchvision.datasets import ImageFolder
@@ -16,22 +20,23 @@ from multitask_foodnet import MultiTaskFoodNet
 import matplotlib.pyplot as plt
 
 class ActiveLearner:
-    def __init__(self, base_dataset, unlabeled_pool):
+    def __init__(self, base_dataset:UECFoodDataset, unlabeled_pool:Union[str, Path]) -> None :
         self.base_dataset = base_dataset
         self.unlabeled_pool = ImageFolder(unlabeled_pool, transform=base_dataset.transform)
         self.labeled_food = set()
-    def update_dataset(self, new_samples):
+    def update_dataset(self, new_samples:Iterable[Any]) -> None:
         self.labeled_food.update(new_samples)
         self.current_dataset = ConcatDataset([self.base_dataset,
                                               Subset(self.unlabeled_pool, list(self.labeled_food))])
 
-def display_image(img):
+def display_image(img:Union[np.ndarray, Image.Image]) -> None:
     plt.figure(figsize=(8,8))
     plt.imshow(img)
     plt.axis("off")
     plt.show()
 
-def human_labeling_interface(samples):
+def human_labeling_interface(samples: Iterable[Tuple[Union[np.ndarray, Image.Image], Any]])\
+        -> List[Tuple[Union[np.ndarray, Image.Image], str]]:
     labeled = []
     for img, pred in samples:
         display_image(img)
@@ -41,9 +46,9 @@ def human_labeling_interface(samples):
 
 
 class FoodClassifier:
-    def __init__(self, model_path:str=None, num_classes:int=256,
-                 device:torch.device = None, quantized:bool = False,
-                 active_learner = None, label_smoothing=0.1):
+    def __init__(self, model_path:Optional[str]=None, num_classes:int=256,
+                 device:Optional[torch.device] = None, quantized:bool = False,
+                 active_learner:Optional[ActiveLearner] = None, label_smoothing:float=0.1) -> None:
         """
         Initialize food classifier with MobileNetV3
         Args:
@@ -78,7 +83,7 @@ class FoodClassifier:
                                              transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                                                   std = [0.229, 0.224, 0.225])])
 
-    def preprocess_image(self, image):
+    def preprocess_image(self, image:Image) -> Tensor:
         """Preprocess image for classification"""
         # Handle path input
         if isinstance(image, (str, Path)):
@@ -107,7 +112,7 @@ class FoodClassifier:
             )
         return tensor.to(self.device)
 
-    def prepare_for_qat(self):
+    def prepare_for_qat(self) -> None:
         """Modify model for quantization-aware training"""
         from pytorch_quantization import quant_modules
         quant_modules.initialize()
@@ -115,7 +120,8 @@ class FoodClassifier:
         # Replace layers with quantized versions
         self.model = quant_modules.quantize_model(self.model)
 
-    def classify_crop(self, image, bbox):
+    def classify_crop(self, image:Union[np.ndarray, Image.Image],
+                      bbox: Tuple[float, float ,float, float]) -> Dict[str, Union[int, float]]:
         """
         Classify a cropped region of an image
         Args:
@@ -144,7 +150,7 @@ class FoodClassifier:
         return {"class_id":int(class_idx),
                 "confidence":float(prob)}
 
-    def get_uncertain_samples(self, pool_loader, top_k=100):
+    def get_uncertain_samples(self, pool_loader:DataLoader, top_k:int=100) -> List[Any]:
         """Identify top-k most uncertain samples"""
         uncertainties = []
         with torch.inference_mode():
@@ -155,24 +161,25 @@ class FoodClassifier:
         indices = np.argsort(uncertainties)[-top_k:]
         return [self.unlabeled_pool[i] for i in indices]
 
-    def active_learning_step(self, pool_loader, human_labeler):
+    def active_learning_step(self, pool_loader:DataLoader, human_labeler:Callable) -> None:
         # 1. Get uncertain samples
         samples = self.get_uncertain_samples(pool_loader)
         # 2. Human labeling
         labeled_data = human_labeler(samples)
         # 3. Update training set
-        self.active_learner.update_dataset(labeled_data)
-        # 4. Retrain
-        self.train(self.active_learner.train_loader, self.active_learner.val_loader)
-
-        if not self.active_learner:
+        if self.active_learner is not None:
+            self.active_learner.update_dataset(labeled_data)
+        else:
             raise ValueError("Active learner not initialized")
+        # 4. Retrain
+        self.train(get_train_transforms(), get_val_transforms())
 
-    def quantize(self):
+    def quantize(self) -> None:
         self.model = quantize_dynamic(self.model.to("cpu"),
                                       {nn.Linear, nn.Conv2d},
                                       dtype=torch.qint8)
-    def train(self, train_loader, val_loader, epochs:int=100, learning_rate:float=0.001):
+    def train(self, train_loader:DataLoader, val_loader:Optional[DataLoader],
+              epochs:int=100, learning_rate:float=0.001) -> None:
         """
         Train the classifier
         Args:
@@ -212,7 +219,9 @@ class FoodClassifier:
             print(f"Train Loss: {train_loss:.4f}")
             print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%")
 
-    def _train_epoch(self, train_loader, optimizer, class_criterion, nutrition_criterion):
+    def _train_epoch(self, train_loader:DataLoader, optimizer:torch.optim.Optimizer,
+                     class_criterion: Callable[[Tensor, Tensor], Tensor],
+                     nutrition_criterion: Callable[[Tensor, Tensor], Tensor]) -> float:
         self.model.train()
         total_loss = 0
 
@@ -234,7 +243,8 @@ class FoodClassifier:
 
         return total_loss / len(train_loader)
 
-    def _validate_epoch(self, val_loader, criterion):
+    def _validate_epoch(self, val_loader:DataLoader,
+                        criterion:Callable[[Tensor, Tensor], Tensor]) -> Tuple[float, float]:
         self.model.eval()
         total_loss = 0
         correct = 0

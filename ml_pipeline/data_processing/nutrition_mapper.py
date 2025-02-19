@@ -4,13 +4,12 @@ import os
 import asyncio
 import aiohttp
 from redis import Redis, ConnectionError as RedisConnectionError
-from typing import Optional, Dict
-
+from typing import Optional, Dict, Any
 
 
 class NutritionMapper:
     def __init__(self, api_key:str,redis_url: str = "redis://localhost:6379",
-                 cache_file:str="nutrition_cache.csv"):
+                 cache_file:str="nutrition_cache.csv") -> None:
         """
         Initializes the NutritionWrapper
         Args:
@@ -35,7 +34,7 @@ class NutritionMapper:
         }
         self.session = aiohttp.ClientSession()
 
-    def _verify_redis_connection(self):
+    def _verify_redis_connection(self) -> None:
         try:
             self.redis.ping()
         except RedisConnectionError:
@@ -44,13 +43,13 @@ class NutritionMapper:
         except Exception as e:
             logging.error(f"Unexpected Redis error: {e}")
             self.redis=None
-    async def close(self):
+    async def close(self) -> None:
         await self.session.close()
-    async def __aenter__(self):
+    async def __aenter__(self) -> "NutritionMapper":
         return self
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, exc_type: Any, exc_val:Any, exc_tb:Any) -> None:
         await self.close()
-    async def get_nutrition_data(self, query: str, max_results: int = 1) -> Optional[Dict]:
+    async def get_nutrition_data(self, query: str, max_results: int = 1) -> Optional[Dict[str, float]]:
         """Async version of the USDA API call with Redis caching"""
         cache_key = f"nutrition:{query.lower()}"
 
@@ -77,15 +76,16 @@ class NutritionMapper:
               if response.status == 200:
                 data = await response.json()
                 if "foods" in data and len(data["foods"])>0:
-                    nutrition = self._parse_nutrition_data(data["foods"][0])
-                    self._cache_data(cache_key, nutrition)
-                    return nutrition
+                    nutritions = self._parse_nutrition_data(data["foods"][0])
+                    self._cache_data(cache_key, nutritions)
+                    return nutritions
               return None
 
-    def _validate_nutrition_values(self, nutrition: Dict) -> Dict:
+    @staticmethod
+    def _validate_nutrition_values(self, nutritions: Dict) -> Dict:
         """Validate and clean nutrition values"""
         cleaned = {}
-        for key, value in nutrition.items():
+        for key, value in nutritions.items():
             try:
                 cleaned[key] = float(value)
                 if cleaned[key] < 0:
@@ -96,7 +96,8 @@ class NutritionMapper:
                 cleaned[key] = 0
         return cleaned
 
-    async def _api_call_with_retry(self, url: str, params: Dict, max_retries: int = 3):
+    async def _api_call_with_retry(self, url: str, params: Dict[str, Any],
+                                   max_retries: int = 3) -> Optional[Dict[str, Any]]:
         for attempt in range(max_retries):
             try:
                 async with self.session.get(url, params=params) as response:
@@ -111,9 +112,10 @@ class NutritionMapper:
                 await asyncio.sleep(2 ** attempt)
         return None
 
-    def _parse_nutrition_data(self, food_item: Dict) -> Dict:
+    @staticmethod
+    def _parse_nutrition_data(self, food_item: Dict[str, Any]) -> Dict[str, float]:
         """Parse nutrition data from USDA API response"""
-        nutrition = {
+        nutritions = {
             "calories": 0,
             "protein": 0,
             "fat": 0,
@@ -125,40 +127,40 @@ class NutritionMapper:
             value = nutrient.get("value", 0)
 
             if "calorie" in name:
-                nutrition["calories"] = value
+                nutritions["calories"] = value
             elif "protein" in name:
-                nutrition["protein"] = value
+                nutritions["protein"] = value
             elif "fat" in name:
-                nutrition["fat"] = value
+                nutritions["fat"] = value
             elif "carbohydrate" in name:
-                nutrition["carbohydrates"] = value
+                nutritions["carbohydrates"] = value
 
-        return nutrition
+        return nutritions
 
-    def _cache_data(self, key: str, nutrition: Dict):
+    def _cache_data(self, key: str, nutritions: Dict[str, float]) -> None:
         """Cache data in both Redis and local cache"""
-        self.cache[key.split(":")[1]] = nutrition
+        self.cache[key.split(":")[1]] = nutritions
 
         if self.redis is not None:
             try:
                 # Store with 24-hour TTL
-                self.redis.hset(key, mapping=nutrition)
+                self.redis.hset(key, mapping=nutritions)
                 self.redis.expire(key, 86400)
             except RedisConnectionError:
                 pass
 
-    async def map_food_label_to_nutrition(self, food_label: str) -> Dict:
+    async def map_food_label_to_nutrition(self, food_labels: str) -> Dict[str, float]:
         """Async version with caching and fallback"""
         try:
-            nutrition = await self.get_nutrition_data(food_label)
+            nutritions = await self.get_nutrition_data(food_label)
 
-            if not nutrition:
+            if not nutritions:
                 return self.get_default_nutrition()
 
-            density = self.density_db.get(food_label.lower(), 0.05)
-            nutrition["calories_per_ml"] = (nutrition["calories"] / 100) * density
+            density = self.density_db.get(food_labels.lower(), 0.05)
+            nutritions["calories_per_ml"] = (nutritions["calories"] / 100) * density
 
-            return nutrition
+            return nutritions
         except Exception as e:
             logging.error(f"Nutrition mapping failed for {food_label}: {e}")
             return self.get_default_nutrition()
@@ -166,7 +168,7 @@ class NutritionMapper:
     def get_density(self, food_name:str)->float:
         return self.density_db.get(food_name.lower(), 0.05)
 
-    def _load_cache(self):
+    def _load_cache(self) -> Dict[str, Dict[str, float]]:
         """Load cache nutrition data from a CSV file, if available"""
         cache = {}
         if os.path.exists(self.cache_file):
@@ -180,7 +182,8 @@ class NutritionMapper:
                                             "carbohydrates":float(row["carbohydrates"])}
         return cache
 
-    def get_default_nutrition(self):
+    @staticmethod
+    def get_default_nutrition(self) -> Dict[str, float]:
         """
         Returns default nutrional data as a dictionary
         Used as a fallback when no nutrion data is available

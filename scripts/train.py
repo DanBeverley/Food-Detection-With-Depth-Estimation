@@ -1,3 +1,5 @@
+import asyncio
+
 import torch.nn.functional as F
 import torch.utils.data
 from torch.cuda.amp import GradScaler, autocast

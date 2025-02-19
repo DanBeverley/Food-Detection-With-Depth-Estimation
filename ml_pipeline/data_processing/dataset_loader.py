@@ -1,6 +1,5 @@
-import collections
 import os
-from typing import Callable, Any
+from typing import Callable, Any, Optional, Iterable, List, Tuple
 from shape_mapping import UEC256ShapeMapper
 
 import cv2
@@ -10,6 +9,7 @@ from collections import defaultdict
 import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict
+from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
 from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
 from concurrent.futures import ThreadPoolExecutor
 
@@ -17,9 +17,9 @@ from pathlib import Path
 import logging
 
 class UECFoodDataset(Dataset):
-    def __init__(self, root_dir:str,
-                 transform:Callable=None, image_ext:str=".jpg",
-                 nutrition_mapper=None):
+    def __init__(self, root_dir:Optional[str]=None,
+                 transform:Optional[Callable]=None, image_ext:str=".jpg",
+                 nutrition_mapper:Optional[NutritionMapper]=None) -> None:
         """
         Args:
             root_dir (str): Root directory containing subfolders for each food category.
@@ -38,13 +38,13 @@ class UECFoodDataset(Dataset):
         self._validate_nutrition_data()
         self.nutrition_cache: Dict[str, Dict[str, float]] = {}  # {category_name: nutrition_data}
 
-    async def initialize(self):
+    async def initialize(self) -> None:
         """Async initialization hook"""
         if self.nutrition_mapper:
             await self._load_nutrition_data()
             self._validate_nutrition_data()
 
-    async def _load_nutrition_data(self):
+    async def _load_nutrition_data(self) -> None:
         """Async nutrition data loading with parallel requests"""
         if not self.nutrition_mapper:
             return
@@ -63,7 +63,7 @@ class UECFoodDataset(Dataset):
                 logging.warning(f"Failed to load nutrition for {cat_name}: {str(e)}")
                 self.nutrition_cache[cat_name] = self.nutrition_mapper.get_default_nutrition()
 
-    def _validate_nutrition_data(self):
+    def _validate_nutrition_data(self) -> None:
         """Validate cached nutrition data"""
         if not self.nutrition_mapper:
             return
@@ -81,10 +81,10 @@ class UECFoodDataset(Dataset):
             except Exception as e:
                 logging.error(f"Error validating nutrition for {food_name}: {e}")
 
-    def process_batch(self, indices:collections.Iterable) -> list:
+    def process_batch(self, indices:Iterable[int]) -> List[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         return [self.__getitem__(i) for i in indices]
 
-    def _read_category_file(self) -> Any:
+    def _read_category_file(self) -> None:
         categories_file = os.path.join(self.root_dir, "category.txt")
         if os.path.exists(categories_file):
             with open(categories_file, "r") as f:
@@ -107,7 +107,7 @@ class UECFoodDataset(Dataset):
             logging.warning(f"⚠️ Warning: category.txt not found in the root directory.")
             self.id_to_category = None
 
-    def _load_dataset(self) -> Any:
+    def _load_dataset(self) -> None:
         for category in sorted(os.listdir(self.root_dir)):
             category_path = os.path.join(self.root_dir, category)
             if not os.path.isdir(category_path):
@@ -154,7 +154,7 @@ class UECFoodDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.data)
-    def __getitem__(self, idx:int):
+    def __getitem__(self, idx:int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         item:dict = self.data[idx]
 
         # Mask loading verification
@@ -251,7 +251,8 @@ class UECFoodDataset(Dataset):
         return volume*shape_prior.volume_modifier
 
 # Custom Collate Function
-def collate_fn(batch:collections.Iterable) -> tuple:
+def collate_fn(batch:Iterable[Tuple[torch.Tensor,
+               Dict[str, torch.Tensor]]]) -> Tuple[torch.Tensor, Dict[str, Any]]:
     image = []
     detection_targets = []
     nutrition_targets = []
