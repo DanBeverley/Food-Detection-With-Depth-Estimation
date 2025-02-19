@@ -24,7 +24,8 @@ class ShapePrior:
 class UEC256ShapeMapper:
     def __init__(self):
         self.category_map = self._initialize_category_map()
-    def _initialize_category_map(self)->Dict[str, ShapePrior]:
+    @staticmethod
+    def _initialize_category_map()->Dict[str, ShapePrior]:
         """Initialize shape mapping for UEC-256 food categories.
         Based on typical Japanese food serving styles and shapes"""
         return {

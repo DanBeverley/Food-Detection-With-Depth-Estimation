@@ -4,7 +4,7 @@ import os
 import asyncio
 import aiohttp
 from redis import Redis, ConnectionError as RedisConnectionError
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, cast
 
 
 class NutritionMapper:
@@ -82,7 +82,7 @@ class NutritionMapper:
               return None
 
     @staticmethod
-    def _validate_nutrition_values(self, nutritions: Dict) -> Dict:
+    def _validate_nutrition_values(nutritions: Dict) -> Dict:
         """Validate and clean nutrition values"""
         cleaned = {}
         for key, value in nutritions.items():
@@ -113,7 +113,7 @@ class NutritionMapper:
         return None
 
     @staticmethod
-    def _parse_nutrition_data(self, food_item: Dict[str, Any]) -> Dict[str, float]:
+    def _parse_nutrition_data(food_item: Dict[str, Any]) -> Dict[str, float]:
         """Parse nutrition data from USDA API response"""
         nutritions = {
             "calories": 0,
@@ -175,15 +175,16 @@ class NutritionMapper:
             with open(self.cache_file, "r", newline="", encoding="utf-8") as csvfile:
                 reader = csv.DictReader(csvfile)
                 for row in reader:
-                    label = row["label"]
-                    cache[label.lower()] = {"calories":float(row["calories"]),
-                                            "protein":float(row["protein"]),
-                                            "fat":float(row["fat"]),
-                                            "carbohydrates":float(row["carbohydrates"])}
+                    row_dict = cast(Dict[str, str], row)
+                    label = row_dict["label"]
+                    cache[label.lower()] = {"calories":float(row_dict["calories"]),
+                                            "protein":float(row_dict["protein"]),
+                                            "fat":float(row_dict["fat"]),
+                                            "carbohydrates":float(row_dict["carbohydrates"])}
         return cache
 
     @staticmethod
-    def get_default_nutrition(self) -> Dict[str, float]:
+    def get_default_nutrition() -> Dict[str, float]:
         """
         Returns default nutrional data as a dictionary
         Used as a fallback when no nutrion data is available
@@ -200,7 +201,7 @@ if __name__ == "__main__":
 
     # Example: Map the food label 'rice' to its nutrition data.
     food_label = "rice"
-    nutrition = mapper.map_food_label_to_nutrition(food_label)
+    nutrition = asyncio.run(mapper.map_food_label_to_nutrition(food_label))
     if nutrition:
         print(f"Nutrition data for '{food_label}':")
         print(f"Calories: {nutrition['calories']} kcal")

@@ -50,7 +50,7 @@ class FoodTrainingSystem:
         self.logger = logging.getLogger(__name__)
 
     @staticmethod
-    def _validate_config(self, cfg: dict) -> dict:
+    def _validate_config(cfg: dict) -> dict:
         """Validate and set default configuration values"""
         required_keys = ["data_root", "usda_key"]
         for key in required_keys:

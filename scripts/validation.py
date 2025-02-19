@@ -3,19 +3,19 @@ import cv2
 from pathlib import Path
 
 import yaml
-
+from typing import Tuple, Union, List, Dict, Any
 from ml_pipeline.models.food_detector import FoodDetector
 from ml_pipeline.models.food_classifier import FoodClassifier
 from ml_pipeline.data_processing.volume_estimation import HybridPortionEstimator
 
 class FoodSystemValidator:
-    def __init__(self, config):
+    def __init__(self, config) -> None:
         self.detector = FoodDetector(**config["detector"])
         self.classifier = FoodClassifier(**config["classifier"])
         self.estimator = HybridPortionEstimator(**config["estimator"])
         self.logger = logging.getLogger("Validation")
-    def validate_image(self, img_path:str):
-        """Fulll pipeline validation for single step"""
+    def validate_image(self, img_path:str)  -> Tuple[bool, Union[List[Dict[str, Any]], str]]:
+        """Full pipeline validation for single step"""
         try:
             # Load and preprocess
             img = cv2.imread(str(img_path))
@@ -41,12 +41,12 @@ class FoodSystemValidator:
             self.logger.error(f"Validation failed: {str(e)}")
             return False, str(e)
 
-def run_validation_suite(config:yaml, test_dir:str="test_images"):
+def run_validation_suite(config:yaml, test_dir:str="test_images") -> None:
     test_images = list(Path(test_dir).glob("*.*"))
     validator = FoodSystemValidator(config) # Load from unified config
 
     for img_path in test_images:
-        success, result = validator.validate_image(img_path)
+        success, result = validator.validate_image(str(img_path))
         if success:
             print(f"Validation passed for {img_path.name}")
             print(f"Results: {result}")

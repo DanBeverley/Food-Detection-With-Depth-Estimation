@@ -1,23 +1,27 @@
+from typing import Optional, List, Union, Dict, Tuple
+
 import torch
 import numpy as np
+from torch.utils.data import DataLoader
+from torch.version import cuda
+
 from ml_pipeline.utils.optimization import ModelOptimizer
 import tensorrt as trt
-import pycuda.driver as cuda
-import pycuda.autoinit
 from ultralytics import YOLO
 from pathlib import Path
 import logging
 import cv2
 
 class FoodDetector:
-    def __init__(self, model_path:str=None, confidence:float=0.5, device:torch.device=None,
+    def __init__(self, model_path:Optional[str]=None, confidence:float=0.5,
+                 device:Optional[torch.device]=None,
                  half_precision:bool=True, quantized:bool=False):
         """
        Initialize the food detector with YOLOv8
        Args:
            model_path: Path to custom trained YOLO model, if None uses pretrained
            confidence: Detection confidence threshold
-           device: Device to run model on ('cuda', 'cpu', etc)
+           device: Device to run model on ('cuda', 'cpu', etc.)
        """
         self.conf_threshold = confidence
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,7 +43,7 @@ class FoodDetector:
 
         self._setup_tensorrt()
 
-    def _setup_tensorrt(self):
+    def _setup_tensorrt(self) -> None:
         self.trt_logger = trt.Logger(trt.Logger.WARNING)
         self.trt_engine = None
         self.context = None
@@ -48,22 +52,24 @@ class FoodDetector:
         self.inputs = []
         self.outputs = []
         self.input_shape = (3, 640, 640)
-    def __del__(self):
+
+    def __del__(self) -> None:
         if self.context:
             self.context.__del__()
         if self.trt_engine:
             self.trt_engine.__del__()
 
-    def detect_batch(self, images:torch.Tensor, batch_size:int=32):
+    def detect_batch(self, images:Union[str, np.ndarray], batch_size:int=32) -> List[Dict[str, Union[List, float, int]]]:
         """Process images in batches"""
         results = []
         for i in range(0, len(images), batch_size):
             batch = images[i:i+batch_size]
             batch_results = self.model(batch, conf=self.conf_threshold)
-            results.extend(self._process_results(batch_results))
+            results.extend(self._process_results(batch_results, return_masks=False, original_shape=(640,640)))
         return results
 
-    def preprocess_image(self, image:torch.Tensor):
+    @staticmethod
+    def preprocess_image(image:Union[str, np.ndarray]) -> np.ndarray:
         """Preprocess image for YOLO model"""
         if isinstance(image, np.ndarray):
             if image.dtype != np.uint8:
@@ -85,7 +91,7 @@ class FoodDetector:
         """Export YOLOv8 to TensorRT engine with proper optimization"""
         ModelOptimizer.export_tensorrt(self.model, output_path=output_path)
 
-    def _preprocess(self, image):
+    def _preprocess(self, image:Union[str, np.ndarray]) -> np.ndarray:
         """Preprocess image for TensorRT inference"""
         # Resize and Normalize
         img = cv2.resize(image, self.input_shape[1:][::-1])
@@ -96,7 +102,8 @@ class FoodDetector:
             img = np.expand_dims(img, axis=0)
         return img
 
-    def detect(self, image, return_masks=False):
+    def detect(self, image:Union[str, np.ndarray],
+               return_masks:bool=False) -> List[Dict[str, Union[List, float, int]]]:
         """
         Detect food items in image with optional segmentation masks
         Args:
@@ -112,7 +119,9 @@ class FoodDetector:
                              verbose=False, device=self.device)
         return self._process_results(results, return_masks, image.shape[:2])
 
-    def _process_results(self, results, return_masks, original_shape):
+    @staticmethod
+    def _process_results(results:List, return_masks:bool,
+                         original_shape:Tuple) -> List[Dict[str, Union[np.ndarray, float, int]]]:
         # Process results
         detections = []
         for result in results:
@@ -133,27 +142,24 @@ class FoodDetector:
                 detections.append(detection)
         return detections
 
-
-    def prepare_for_qat(self):
+    @staticmethod
+    def prepare_for_qat():
         """Modify model for quantization-aware training"""
         from pytorch_quantization import quant_modules
         quant_modules.initialize()
 
-        # Replace layers with quantized versions
-        self.model = quant_modules.quantize_model(self.model)
-
-    def calibrate_model(self, calib_loader):
+    def calibrate_model(self, calib_loader:DataLoader) -> None:
         """Run calibration for INT8 quantization"""
         self.model.eval()
         with torch.no_grad():
             for images, _ in calib_loader:
                 self.model(images.to(self.device))
 
-    def quantize(self):
+    def quantize(self) -> None:
         self.model = ModelOptimizer.quantize_model(self.model)
 
     def train(self, data_yaml:str, epochs:int = 100, batch_size:int=16,
-              image_size:int=640):
+              image_size:int=640) -> None:
         """
         Train/Finetune YOLO model on custom dataset
         Args:

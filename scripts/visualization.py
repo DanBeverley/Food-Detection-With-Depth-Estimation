@@ -1,9 +1,11 @@
 import matplotlib.pyplot as plt
 import cv2
+import numpy as np
+
 
 class FoodVisualizer:
     @staticmethod
-    def plot_detection(image, detections, nutrition_info):
+    def plot_detection(image:np.ndarray, detections, nutrition_info) -> None:
         plt.figure(figsize=(12,8))
         plt.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         for det, nutrition in zip(detections, nutrition_info):

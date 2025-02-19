@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import csv
 from pathlib import Path
 from typing import Callable
