@@ -2,11 +2,22 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torchvision
+
 
 def create_backbone(arch:str="mobilenet_v3_small", pretrained:bool=True) -> nn.Sequential:
     """Create feature extraction backbone"""
-    model = torch.hub.load("pytorch/vision:v0.10.0", arch, pretrained=pretrained)
-    return nn.Sequential(*list(model.children())[:-1])
+    if hasattr(torchvision.models, arch):
+        model = torchvision.models.__dict__[arch](pretrained=pretrained)
+    else:
+        raise ValueError(f"Invalid architecture: {arch}")
+    # Handle backbone structure
+    if arch.startswith("resnet"):
+        return nn.Sequential(*list(model.children()))[:-2]
+    elif arch.startswith("efficientnet"):
+        return model.features
+    else: # MobileNetV3/DenseNet etc.
+        return nn.Sequential(*list(model.children())[:-1])
 
 def create_multitask_head(in_features:int) -> nn.Sequential:
     """Create nutrition estimation head"""

@@ -41,14 +41,15 @@ class MultiTaskFoodNet(nn.Module):
             shared = self.shared_fc(features)
             # Scale outputs to realistic ranges
             nutrition = self.nutrition_head(shared)
+            nutrition = torch.clamp(nutrition, min=0)
             nutrition = torch.stack([
                 nutrition[:, 0] * self.calories_scale,
                 nutrition[:, 1] * self.protein_scale,
-                nutrition[:, 2],
-                nutrition[:, 3]
+                torch.clamp(nutrition[:, 2], 0, 100), # Fat percentage,
+                torch.clamp(nutrition[:, 3],0 , 100) # Carbs Percentage
             ], dim = 1)
             return {"class":self.class_head(shared),
-                    "nutrition":torch.clamp(nutrition, min = 0.0)}
+                    "nutrition":nutrition}
         except RuntimeError as e:
             logging.error(f"Forward pass failed: {e}")
             raise

@@ -161,9 +161,20 @@ class NutritionMapper:
         try:
             params = {"api_key": self.api_key, "query": food_labels}
             async with session.get(self.base_url, params=params) as response:
-                  if response.status == 200:
-                      data = await response.json()
-                      return data
+                  if response.status != 200:
+                      logging.error(f"API Error: {response.status}")
+                      return self.get_default_nutrition()
+                  data = await response.json()
+                  if not data.get("foods"):
+                      return self.get_default_nutrition()
+                  food = data["foods"][0]
+                  return {"calories": food.get("calories",0),
+                          "protein":food.get("protein",0),
+                          "fat":food.get("fat",0),
+                          "carbohydrates":food.get("carbohydrates",0)}
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logging.error(f"Request failed: {str(e)}")
+            return self.get_default_nutrition()
         finally:
             if not hasattr(self, "session"):
                 await session.close()

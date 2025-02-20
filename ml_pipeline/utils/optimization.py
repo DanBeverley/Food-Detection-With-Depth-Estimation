@@ -22,7 +22,8 @@ class ModelOptimizer:
         torch.onnx.export(model, dummy_input, onnx_path)
 
     @staticmethod
-    def export_tensorrt(model:nn.Module, input_shape:Tuple[int, ...]=(3, 640, 640), output_path:str="model.trt") -> trt.ICudaEngine:
+    def export_tensorrt(model:nn.Module, input_shape:Tuple[int, ...]=(3, 640, 640),
+                        output_path:str="model.trt") -> trt.ICudaEngine:
         """Export model to TensorRT engine"""
         logger = trt.Logger(trt.Logger.WARNING)
         builder = trt.Builder(logger)

@@ -91,32 +91,32 @@ class FoodTrainingSystem:
 
         # Initialize dataloaders
         self.train_loader = torch.utils.data.DataLoader(self.train_dataset,
-                                                        batch_size=self.config["batch_size"],
+                                                        batch_size=self.config_params["training"]["batch_size"],
                                                         shuffle=True,
-                                                        num_workers=self.config.get("num_workers",4),
+                                                        num_workers=self.config_params["training"]["num_workers"],
                                                         persistent_workers=True,
                                                         pin_memory=True if self.device.type == "cuda" else False,
                                                         drop_last=True)
 
         self.val_loader = torch.utils.data.DataLoader(
             self.val_dataset,
-            batch_size=self.config["batch_size"],
+            batch_size=self.config_params["training"]["batch_size"],
             shuffle=False,
-            num_workers=self.config.get("num_workers", 4),
+            num_workers=self.config_params["training"]["num_workers"],
             pin_memory=True if self.device.type == "cuda" else False
         )
 
         # Models
         self.detector = FoodDetector(
-            quantized=self.config["quantize"],
+            quantized=self.config_params["training"]["quantize"],
             device=self.device
         )
         self.classifier= FoodClassifier(
             num_classes=256,
             active_learner=ActiveLearner(
                 self.dataset,
-                self.config["unlabeled_pool"]
-            ) if self.config.get("active_learning") else None,
+                self.config_params["unlabeled_pool"] #TODO: add this to the config
+            ) if self.config_params["training"]["active_learning"] else None,
             device=self.device
         )
 
@@ -126,11 +126,11 @@ class FoodTrainingSystem:
         self.optimizer = torch.optim.AdamW([
             {
                 "params": self.classifier.model.parameters(),
-                "lr": self.config["lr"]
+                "lr": self.config_params["training"]["learning_rate"]
             },
             {
                 "params": self.detector.model.parameters(),
-                "lr": self.config["lr"] * 0.1
+                "lr": self.config_params["training"]["learning_rate"] * 0.1
             }
         ], weight_decay=1e-4)
 
@@ -166,26 +166,26 @@ class FoodTrainingSystem:
             self._initialize_qat()
 
         # Accumulation steps for larger effective batch size
-        is_accumulation_step = (batch_idx + 1) % self.config["accumulation_steps"]
+        is_accumulation_step = (batch_idx + 1) % self.config_params["training"]["accumulation_steps"]
 
         # Mixed precision training
-        with autocast(enabled=self.config["mixed_precision"]):
+        with autocast(enabled=self.config_params["training"]["mixed_precision"]):
             loss = self._forward_pass(val_images, val_targets)
 
             # Scale loss for gradient accumulations
-            if self.config["accumulation_steps"]>1:
-                loss = loss/self.config["accumulation_steps"]
+            if self.config_params["training"]["accumulation_steps"]>1:
+                loss = loss/self.config_params["training"]["accumulation_steps"]
 
         # Backward pass with gradient scaling
         self.scaler.scale(loss).backward()
 
         if not is_accumulation_step:
             # Gradient clipping
-            if self.config["gradient_clip_val"]>0:
+            if self.config_params["training"]["gradient_clip_val"]>0:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm(
                     self._get_trainable_parameters(),
-                    self.config["gradient_clip_val"]
+                    self.config_params["training"]["gradient_clip_val"]
                 )
 
             # Optimization
@@ -194,7 +194,7 @@ class FoodTrainingSystem:
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
         # Active learning
-        if self.config.get("active_learning") and batch_idx % 100 == 0:
+        if self.config_params["training"]["active_learning"] and batch_idx % 100 == 0:
             self._active_learning_step()
 
         return loss.item()
@@ -215,12 +215,7 @@ class FoodTrainingSystem:
 
     def _calculate_loss(self, outputs, val_targets, detections) -> float:
         """Calculate combined loss"""
-        weights = self.config.get("loss_weights", {
-            "classification": 1.0,
-            "nutrition": 0.3,
-            "portion": 0.2
-        })
-
+        weights = self.config_params["training"]["loss_weights"]
         losses = {
             "classification": F.cross_entropy(
                 outputs["class"],
@@ -241,8 +236,8 @@ class FoodTrainingSystem:
     def _should_start_qat(self, epoch: int) -> bool:
         """Check if QAT should be initialized"""
         return (
-            self.config["qat_enabled"] and
-            epoch == self.config["qat_start_epoch"] and
+            self.config_params["training"]["qat_enabled"] and
+            epoch == self.config_params["training"]["qat_start_epoch"] and
             not hasattr(self, 'qat_initialized')
         )
 
@@ -257,7 +252,7 @@ class FoodTrainingSystem:
         """Main training loop"""
         self.initialize()
         try:
-            for epoch in range(self.config["epochs"]):
+            for epoch in range(self.config_params["training"]["epochs"]):
                 self.current_epoch = epoch
 
                 # Training
@@ -286,10 +281,10 @@ class FoodTrainingSystem:
         self.classifier.model.eval()
         self.detector.model.eval()
         total_loss = 0.0
-        with torch.no_grad(), autocast(enabled=self.config["mixed_precision"]):
+        with torch.no_grad(), autocast(enabled=self.config_params["training"]["mixed_precision"]):
             for val_images, val_targets in self.val_loader:
                 val_images = val_images.to(self.device)
-                with autocast(enabled=self.config["mixed_precision"]):
+                with autocast(enabled=self.config_params["training"]["mixed_precision"]):
                     loss_tensor = self._forward_pass(val_images, val_targets)
                 if isinstance(loss_tensor, torch.Tensor):
                     total_loss += loss_tensor.item()
@@ -309,7 +304,7 @@ class FoodTrainingSystem:
         self._save_checkpoint(f"epoch_{self.current_epoch}")
 
         # Early stopping
-        if self.early_stopping_counter >= self.config["early_stopping_patience"]:
+        if self.early_stopping_counter >= self.config_params["training"]["early_stopping_patience"]:
             print(f"Early stopping triggered after {self.current_epoch + 1} epochs")
             return True
 
@@ -341,7 +336,7 @@ class FoodTrainingSystem:
         """Check if TensorRT export should be performed"""
         return (
                 self.device.type == "cuda" and
-                epoch % self.config["trt_validation_freq"] == 0
+                epoch % self.config_params["tensorrt"]["trt_validation_freq"] == 0
         )
 
     def _export_trt_checkpoint(self, epoch:int):
@@ -356,7 +351,7 @@ class FoodTrainingSystem:
             logging.info("Unlabeled pool is empty. Skipping active learning step")
             return
         pool_loader = DataLoader(self.classifier.active_learner.unlabeled_pool, batch_size=32,
-                                 num_workers = self.config["num_workers"], shuffle=True,
+                                 num_workers = self.config_params["training"]["num_workers"], shuffle=True,
                                  pin_memory=True)
         samples = self.classifier.get_uncertain_samples(pool_loader)
         labeled_data = human_labeling_interface(samples)
