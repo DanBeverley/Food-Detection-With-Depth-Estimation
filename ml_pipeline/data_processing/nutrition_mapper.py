@@ -161,7 +161,9 @@ class NutritionMapper:
         try:
             params = {"api_key": self.api_key, "query": food_labels}
             async with session.get(self.base_url, params=params) as response:
-
+                  if response.status == 200:
+                      data = await response.json()
+                      return data
         finally:
             if not hasattr(self, "session"):
                 await session.close()
@@ -170,13 +172,14 @@ class NutritionMapper:
             try:
                 nutritions = await self.get_nutrition_data(food_labels)
                 if not nutritions:
+                    logging.warning(f"No nutrition data found for {food_labels}, using default nutrition")
                     return self.get_default_nutrition()
                 density = self.density_db.get(food_labels.lower(), 0.05)
                 nutritions["calories_per_ml"] = (nutritions["calories"] / 100) * density
                 return nutritions
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt == attempts - 1:
-                    logging.error(f"Failed after {attempts} attempts: {e}")
+                    logging.error(f"Failed after {attempts} attempts: {e}, Switching to use default nutrition")
                     return self.get_default_nutrition()
                 await asyncio.sleep(2 ** attempt)
 

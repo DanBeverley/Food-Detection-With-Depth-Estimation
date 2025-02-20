@@ -3,7 +3,8 @@ from typing import Optional, List, Union, Dict, Tuple
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
-from torch.version import cuda
+import pycuda.driver as cuda
+import pycuda.autoinit
 
 from ml_pipeline.utils.optimization import ModelOptimizer
 import tensorrt as trt
@@ -68,6 +69,7 @@ class FoodDetector:
                 self.context = self.trt_engine.create_execution_context
                 self._allocate_buffers()
             else:
+                self.build_trt_engine()
                 logging.warning("TensorRT engine not found, using Pytorch model")
         except Exception as e:
             logging.error(f"TensorRT setup failed: {e}")
@@ -77,17 +79,6 @@ class FoodDetector:
             self.inputs = []
             self.outputs = []
             self.input_shape = (3, 640, 640)
-
-    def build_trt_engine(self, output_path="yolov8.trt") -> None:
-        """Proper TensorRT export implementation"""
-        from torch2trt import torch2trt
-        dummy_input = torch.randn(1, 3, 640, 640).to(self.device)
-        model_trt = torch2trt(self.model,
-                              [dummy_input],
-                              fp16_mode=True,
-                              max_workspace_size=1 << 25)
-        with open(output_path, "wb") as f:
-            f.write(model_trt.engine.serialize())
 
     def __del__(self) -> None:
         if self.context:
@@ -178,6 +169,8 @@ class FoodDetector:
                                       interpolation=cv2.INTER_NEAREST)
                     detection["mask"] = mask.astype(np.float32)
                 detections.append(detection)
+        if not detections:
+            logging.warning("No detections were found...")
         return detections
 
     @staticmethod

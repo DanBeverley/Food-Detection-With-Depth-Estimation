@@ -4,7 +4,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import scipy
 import torch
 from torchvision.ops import box_convert
 from scipy.spatial import ConvexHull
@@ -73,7 +72,7 @@ class HybridPortionEstimator:
         # Convert BGR to RGB
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # 1. Detect reference objects (plates, credit cards, etc)
+        # 1. Detect reference objects (plates, credit cards, etc.)
         ref_objects = self._detect_reference_objects(img_rgb)
 
         # 2. Calculate pixel-to-cm ratio

@@ -11,13 +11,15 @@ import torch.nn.functional as F
 import torch.cuda
 from ml_pipeline.data_processing.dataset_loader import UECFoodDataset
 from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
-
+from configs.config_loader import load_config
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
 from torchvision.datasets import ImageFolder
 from multitask_foodnet import MultiTaskFoodNet
 import matplotlib.pyplot as plt
+
+config = load_config()
 
 class ActiveLearner:
     def __init__(self, base_dataset:UECFoodDataset, unlabeled_pool:Union[str, Path]) -> None :
@@ -62,7 +64,8 @@ class FoodClassifier:
         self.num_classes = num_classes
 
         # Initialize model
-        self.model = MultiTaskFoodNet(num_classes=num_classes)
+        self.model = MultiTaskFoodNet(num_classes=num_classes, calories_scale=config.get("calories_scale"),
+                                      protein_scale = config.get("protein_scale"))
 
         # Load train weights if provided
         if model_path and Path(model_path).exists():

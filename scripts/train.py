@@ -1,5 +1,3 @@
-import asyncio
-
 import torch.nn.functional as F
 import torch.utils.data
 from torch.cuda.amp import GradScaler, autocast
@@ -230,8 +228,8 @@ class FoodTrainingSystem:
                 val_targets["nutrition"]
             ),
             "portion": F.l1_loss(
-                outputs["portions"],
-                val_targets["portions"]
+                outputs["portion"],
+                val_targets["portion"]
             )
         }
 
@@ -351,6 +349,9 @@ class FoodTrainingSystem:
                                        output_path=f"classifier_epoch_{epoch}.trt")
 
     def _active_learning_step(self):
+        if not self.classifier.active_learner.unlabeled_pool:
+            logging.info("Unlabeled pool is empty. Skipping active learning step")
+            return
         pool_loader = DataLoader(self.classifier.active_learner.unlabeled_pool, batch_size=32,
                                  num_workers = self.config["num_workers"], shuffle=True,
                                  pin_memory=True)

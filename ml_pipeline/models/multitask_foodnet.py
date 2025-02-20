@@ -6,7 +6,8 @@ from torch import nn
 from model_factory import create_backbone, get_feature_dim, create_multitask_head
 
 class MultiTaskFoodNet(nn.Module):
-    def __init__(self, num_classes:int = 256) -> None:
+    def __init__(self, num_classes:int, calories_scale:int,
+                 protein_scale:int) -> None:
         super().__init__()
         self.feature_extractor = create_backbone()
         in_features = get_feature_dim(self.feature_extractor)
@@ -26,8 +27,8 @@ class MultiTaskFoodNet(nn.Module):
         self.nutrition_head = create_multitask_head(1024)
 
         # Initialize scaling factors as registered buffers instead of parameters
-        self.register_buffer('calories_scale', torch.tensor([500.0]))
-        self.register_buffer('protein_scale', torch.tensor([100.0]))
+        self.register_buffer('calories_scale', torch.tensor([calories_scale]))
+        self.register_buffer('protein_scale', torch.tensor([protein_scale]))
         def init_weights(m:nn.Module) -> None:
             if isinstance(m ,nn.Linear):
                 torch.nn.init.kaiming_normal_(m.weight)
@@ -47,7 +48,7 @@ class MultiTaskFoodNet(nn.Module):
                 nutrition[:, 3]
             ], dim = 1)
             return {"class":self.class_head(shared),
-                    "nutrition":nutrition}
+                    "nutrition":torch.clamp(nutrition, min = 0.0)}
         except RuntimeError as e:
             logging.error(f"Forward pass failed: {e}")
             raise
