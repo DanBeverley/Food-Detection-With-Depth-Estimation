@@ -202,9 +202,10 @@ class FoodTrainingSystem:
         return list(self.classifier.model.parameters()) + list(self.detector.model.parameters())
     def _forward_pass(self, val_images, val_targets):
         """Forward pass through both models"""
-        detections = self.detector.detect(val_images, return_masks=True)
-        class_outputs = self.classifier.model(val_images)
-
+        numpy_images = val_images.cpu().numpy().transpose(0,2,3,1)
+        detections = self.detector.detect(numpy_images, return_masks=True)
+        class_outputs = self.classifier.model(numpy_images)
+        assert "portions" in targets, "Missing portion data in targets"
         return self._calculate_loss(
             class_outputs,
             val_targets,

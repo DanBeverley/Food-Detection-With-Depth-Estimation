@@ -2,6 +2,8 @@ import logging
 import csv
 import os
 import asyncio
+import socket
+
 import aiohttp
 from redis import Redis, ConnectionError as RedisConnectionError
 from typing import Optional, Dict, Any, cast
@@ -106,10 +108,14 @@ class NutritionMapper:
                     elif response.status == 429:  # Rate limit
                         await asyncio.sleep(2 ** attempt)
                         continue
-            except Exception as e:
+            except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError, socket.gaierror, asyncio.CancelledError) as e:
                 if attempt == max_retries - 1:
                     raise
                 await asyncio.sleep(2 ** attempt)
+                logging.warning(f"Request failed: {e}. Retrying (attempt {attempt+1}/{max_retries})...")
+            except Exception as e:
+                logging.warning(f"Unexpected error occured: {e}")
+                raise
         return None
 
     @staticmethod
@@ -151,19 +157,28 @@ class NutritionMapper:
 
     async def map_food_label_to_nutrition(self, food_labels: str) -> Dict[str, float]:
         """Async version with caching and fallback"""
+        session = getattr(self, "session", aiohttp.ClientSession())
         try:
-            nutritions = await self.get_nutrition_data(food_label)
+            params = {"api_key": self.api_key, "query": food_labels}
+            async with session.get(self.base_url, params=params) as response:
 
-            if not nutritions:
-                return self.get_default_nutrition()
-
-            density = self.density_db.get(food_labels.lower(), 0.05)
-            nutritions["calories_per_ml"] = (nutritions["calories"] / 100) * density
-
-            return nutritions
-        except Exception as e:
-            logging.error(f"Nutrition mapping failed for {food_label}: {e}")
-            return self.get_default_nutrition()
+        finally:
+            if not hasattr(self, "session"):
+                await session.close()
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                nutritions = await self.get_nutrition_data(food_labels)
+                if not nutritions:
+                    return self.get_default_nutrition()
+                density = self.density_db.get(food_labels.lower(), 0.05)
+                nutritions["calories_per_ml"] = (nutritions["calories"] / 100) * density
+                return nutritions
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt == attempts - 1:
+                    logging.error(f"Failed after {attempts} attempts: {e}")
+                    return self.get_default_nutrition()
+                await asyncio.sleep(2 ** attempt)
 
     def get_density(self, food_name:str)->float:
         return self.density_db.get(food_name.lower(), 0.05)

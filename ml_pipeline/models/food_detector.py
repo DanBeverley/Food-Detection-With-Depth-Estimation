@@ -43,15 +43,51 @@ class FoodDetector:
 
         self._setup_tensorrt()
 
-    def _setup_tensorrt(self) -> None:
-        self.trt_logger = trt.Logger(trt.Logger.WARNING)
-        self.trt_engine = None
-        self.context = None
-        self.stream = cuda.Stream()
+    def _load_trt_engine(self) -> trt.ICudaEngine:
+        """Load pre-built TensorRT engine"""
+        with open("yolov8.trt", "rb") as f, trt.Runtime(self.trt_logger) as runtime:
+            return runtime.deserialize_cuda_engine(f.read())
+    def _allocate_buffers(self) -> None:
+        """Allocate input/output buffers for TensorRT"""
         self.bindings = []
-        self.inputs = []
-        self.outputs = []
-        self.input_shape = (3, 640, 640)
+        for binding in self.trt_engine:
+            size = trt.volume(self.trt_engine.get_binding_shape(binding)) * self.trt_engine.max_batch_size
+            dtype = trt.nptype(self.trt_engine.get_binding_dtype(binding))
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            self.bindings.append(int(device_mem))
+            if self.trt_engine.binding_is_input(binding):
+                self.inputs.append({"host": host_mem, "device": device_mem})
+            else:
+                self.outputs.append({"host": host_mem, "device": device_mem})
+    def _setup_tensorrt(self) -> None:
+        try:
+            if Path("yolov8.trt").exists():
+                self.trt_logger = trt.Logger(trt.Logger.WARNING)
+                self.trt_engine = self._load_trt_engine()
+                self.context = self.trt_engine.create_execution_context
+                self._allocate_buffers()
+            else:
+                logging.warning("TensorRT engine not found, using Pytorch model")
+        except Exception as e:
+            logging.error(f"TensorRT setup failed: {e}")
+            self.trt_engine = None
+            self.stream = cuda.Stream()
+            self.bindings = []
+            self.inputs = []
+            self.outputs = []
+            self.input_shape = (3, 640, 640)
+
+    def build_trt_engine(self, output_path="yolov8.trt") -> None:
+        """Proper TensorRT export implementation"""
+        from torch2trt import torch2trt
+        dummy_input = torch.randn(1, 3, 640, 640).to(self.device)
+        model_trt = torch2trt(self.model,
+                              [dummy_input],
+                              fp16_mode=True,
+                              max_workspace_size=1 << 25)
+        with open(output_path, "wb") as f:
+            f.write(model_trt.engine.serialize())
 
     def __del__(self) -> None:
         if self.context:
@@ -112,6 +148,8 @@ class FoodDetector:
         Returns:
             list of dict containing detection results
         """
+        if isinstance(image, torch.Tensor):
+            image = image.cpu().numpy().transpose(1,2,0)
         image = self.preprocess_image(image)
 
         # Run inference

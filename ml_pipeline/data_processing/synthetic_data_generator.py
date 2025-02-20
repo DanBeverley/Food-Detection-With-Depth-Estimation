@@ -9,6 +9,8 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torchvision
+
+from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
 from ml_pipeline.utils.transforms import get_gan_transforms
 from torch import optim
 import torch.autograd as autograd
@@ -179,6 +181,13 @@ class GANTrainer:
             sample_filename: Name of the generated sample file
             generation_params: Dictionary of generation parameters (optional)
         """
+        food_categories = ["rice", "sushi", "ramen", "tempura"]
+        fake_label = np.random.choice(food_categories)
+        if self.nutrition_mapper:
+            nutrition = self.nutrition_mapper.map_food_label_to_nutrition(fake_label)
+        else:
+            nutrition = NutritionMapper.get_default_nutrition()
+
         if generation_params is None:
             generation_params = {}
         # Generate realistic portion estimates based on food type

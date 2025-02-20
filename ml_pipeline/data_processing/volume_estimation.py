@@ -1,7 +1,10 @@
 import logging
 import os
+from pathlib import Path
+
 import cv2
 import numpy as np
+import scipy
 import torch
 from torchvision.ops import box_convert
 from scipy.spatial import ConvexHull
@@ -13,6 +16,7 @@ class HybridPortionEstimator:
     def __init__(self, device=None, nutrition_mapper=None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.nutrition_mapper = nutrition_mapper
+        self.depth_cache = {}
         self._load_models()
 
         # Food type to density mapping (g/cm³)
@@ -129,7 +133,7 @@ class HybridPortionEstimator:
     def _calculate_scale(ref_objects, known_width_cm):
         """calculate scale using best reference object"""
         if not ref_objects:
-            return 0.1 # Fallback default
+            return 22/640 # Fallback default
 
         # Select most confident reference object
         best_ref = max(ref_objects, key=lambda x:x["confidence"])
@@ -167,11 +171,20 @@ class HybridPortionEstimator:
         }
         physical_size = reference_sizes.get(best_ref["label"], known_width_cm)
         return physical_size/ref_width
-    @lru_cache(maxsize=32)
-    def _get_depth_map(self, image):
+    @lru_cache(maxsize=128)
+    def _get_depth_map(self, image:np.ndarray) -> np.ndarray:
         """Get depth map using MiDaS"""
-        image_hash = hash(image.tobytes())
-        return self.midas(image_hash)
+        if hasattr(image, "filename"):
+            cache_key = Path(image.filename).stem
+        else:
+            cache_key = hash(image.tobytes())
+        # Check cache first
+        if cache_key in self.depth_cache:
+            return self.depth_cache[cache_key]
+        # Compute and cache
+        depth = self.midas(image)
+        self.depth_cache[cache_key] = depth
+        return depth
 
     @staticmethod
     def _calculate_volume_confidence(depth_quality:float, mask_quality:float,
@@ -343,8 +356,9 @@ class UECVolumeEstimator:
         try:
             hull = ConvexHull(mask_points)
             return mask_points[hull.vertices]
-        except:
+        except Exception as e:
             return mask_points
+
 
     def _calculate_confidence(self, mask, depth_map, prior):
         """Calculate confidence score for volume estimation"""

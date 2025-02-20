@@ -83,18 +83,35 @@ class FoodClassifier:
                                              transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                                                   std = [0.229, 0.224, 0.225])])
 
-    def preprocess_image(self, image:Image) -> Tensor:
+    def preprocess_image(self, image:Union[str, Path, np.ndarray, Image.Image]) -> Tensor:
         """Preprocess image for classification"""
-        # Handle path input
+        # Handle different input types
         if isinstance(image, (str, Path)):
-            image = cv2.imread(str(image))
-            if image is None:
+            img = cv2.imread(str(image))
+            if img is None:
                 raise ValueError(f"Could not read image from {image}")
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        elif isinstance(image, np.ndarray):
+            img = image.copy()
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            elif img.shape[2] == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+            elif img.shape[2] == 1:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif isinstance(image, (str, Path)):
+            img = cv2.imread(str(image))
+        elif isinstance(image, Image.Image):
+            img = np.array(image)
+        else:
+            raise TypeError(f"Unsupported image type: {type(image)}")
+        if image is None:
+            raise ValueError(f"Could not read image from {image}")
+            img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         # Validate numpy array input
         elif isinstance(image, np.ndarray):
             if image.shape[2] == 3:
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             if image.ndim != 3 or image.shape[2] != 3:
                  raise ValueError(f"Invalid image shape: {image.shape}"
                                   "Expected (H, W, 3) RGB array")
@@ -104,6 +121,7 @@ class FoodClassifier:
         else:
             raise TypeError("Input must be path string or numpy array")
         # Convert to tensor with explicit channel dimension
+        tensor = self.transform(Image.fromarray(img))
         tensor = torch.from_numpy(image).permute(2,0,1).float()/255.0 # CxHxW
         if tensor.shape[0]!=3:
             raise ValueError(
@@ -176,6 +194,8 @@ class FoodClassifier:
         self.model = quantize_dynamic(self.model.to("cpu"),
                                       {nn.Linear, nn.Conv2d},
                                       dtype=torch.qint8)
+        self.model.to(self.device)
+
     def train(self, train_loader:DataLoader, val_loader:Optional[DataLoader],
               epochs:int=100, learning_rate:float=0.001) -> None:
         """
