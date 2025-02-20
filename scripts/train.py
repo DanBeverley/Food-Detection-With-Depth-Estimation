@@ -2,18 +2,21 @@ import torch.nn.functional as F
 import torch.utils.data
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
-
+from configs.config_loader import get_params
 from ml_pipeline.data_processing.dataset_loader import *
 from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
 from ml_pipeline.models.food_classifier import FoodClassifier, ActiveLearner, human_labeling_interface
 from ml_pipeline.models.food_detector import FoodDetector
 
+#TODO: Remove redundant config file in train.py
 
 class FoodTrainingSystem:
     def __init__(self, cfg:dict):
-        self.config = self._validate_config(cfg = cfg)
-        self.device = torch.device(cfg["device"])
-
+        #self.config = self._validate_config(cfg = cfg)
+        self.config_params = get_params()
+        if self.config_params is None:
+            raise RuntimeError("Configuration could not be loaded")
+        self.device = torch.device(self.config_params["system"]["device"])
         self._setup_logging()
 
         # Initialize components
@@ -32,8 +35,8 @@ class FoodTrainingSystem:
         self.detector.model.to(self.device)
 
         # Load checkpoints if resuming
-        if self.config.get("resume_from"):
-            self._load_checkpoint(self.config["resume_from"])
+        if self.config_params.get("resume_from"):
+            self._load_checkpoint(self.config_params["resume_from"])
 
     def _setup_logging(self):
         """Initialize logging configuration"""
@@ -73,14 +76,14 @@ class FoodTrainingSystem:
     def _init_components(self):
         """Initialize all model components"""
         # Data handling
-        self.nutrition_mapper = NutritionMapper(api_key=self.config["usda_key"])
+        self.nutrition_mapper = NutritionMapper(api_key=self.config_params["system"]["usda_key"])
         self.dataset = UECFoodDataset(
-            root_dir=self.config["data_root"],
+            root_dir=self.config_params["paths"]["dataset"],
             transform=get_train_transforms(),
             nutrition_mapper=self.nutrition_mapper
         )
         # Create train/val split
-        train_size = int(0.8 * len(self.dataset))
+        train_size = int(self.config_params["training"]["train_val_split"] * len(self.dataset))
         val_size = len(self.dataset) - train_size
         self.train_dataset, self.val_dataset = torch.utils.data.random_split(
             self.dataset, [train_size, val_size]

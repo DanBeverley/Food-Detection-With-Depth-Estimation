@@ -11,15 +11,12 @@ import torch.nn.functional as F
 import torch.cuda
 from ml_pipeline.data_processing.dataset_loader import UECFoodDataset
 from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
-from configs.config_loader import load_config
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
 from torchvision.datasets import ImageFolder
 from multitask_foodnet import MultiTaskFoodNet
 import matplotlib.pyplot as plt
-
-config = load_config()
 
 class ActiveLearner:
     def __init__(self, base_dataset:UECFoodDataset, unlabeled_pool:Union[str, Path]) -> None :
@@ -50,7 +47,8 @@ def human_labeling_interface(samples: Iterable[Tuple[Union[np.ndarray, Image.Ima
 class FoodClassifier:
     def __init__(self, model_path:Optional[str]=None, num_classes:int=256,
                  device:Optional[torch.device] = None, quantized:bool = False,
-                 active_learner:Optional[ActiveLearner] = None, label_smoothing:float=0.1) -> None:
+                 active_learner:Optional[ActiveLearner] = None, label_smoothing:float=0.1,
+                 calories_scale:int = 500, protein_scale:int = 100) -> None:
         """
         Initialize food classifier with MobileNetV3
         Args:
@@ -64,8 +62,9 @@ class FoodClassifier:
         self.num_classes = num_classes
 
         # Initialize model
-        self.model = MultiTaskFoodNet(num_classes=num_classes, calories_scale=config.get("calories_scale"),
-                                      protein_scale = config.get("protein_scale"))
+        self.model = MultiTaskFoodNet(num_classes=num_classes,
+                                      calories_scale=calories_scale,
+                                      protein_scale=protein_scale)
 
         # Load train weights if provided
         if model_path and Path(model_path).exists():
