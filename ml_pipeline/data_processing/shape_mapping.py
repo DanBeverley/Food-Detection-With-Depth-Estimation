@@ -25,6 +25,7 @@ class ShapePrior:
 class UEC256ShapeMapper:
     def __init__(self):
         self.category_map = self._initialize_category_map()
+        assert "default" in self.category_map, "Missing default shape prior"
     @staticmethod
     def _initialize_category_map()->Dict[str, ShapePrior]:
         """Initialize shape mapping for UEC-256 food categories.

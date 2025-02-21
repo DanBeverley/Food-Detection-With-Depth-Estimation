@@ -314,7 +314,7 @@ class UECVolumeEstimator:
         height = 2*radius*prior["height_ratio"]
         return np.pi*(radius**2)*height
     @staticmethod
-    def _estimate_irregular_volume(self, depth_map:np.ndarray, mask:np.ndarray,
+    def _estimate_irregular_volume(depth_map:np.ndarray, mask:np.ndarray,
                                    area_cm2: float, prior:ShapePrior,
                                    pixel_scale:float) -> float:
         """
@@ -410,20 +410,20 @@ class UECVolumeEstimator:
 
 
 class UnifiedFoodEstimator:
-    def __init__(self):
+    def __init__(self, category_path:str="category.txt"):
+        self.category_path = category_path
         self.hybrid_estimator = HybridPortionEstimator()
         self.uec_estimator = UECVolumeEstimator()
         self.food_category_map = self._load_uec_categories()
     @staticmethod
-    def _load_uec_categories():
+    def _load_uec_categories(self):
         """
         Loads category mapping from a file (e.g., 'category.txt')
         If the file doesn't exist, a default mapping is used.
         """
-        category_file = "/category.txt"
         mapping = {}
-        if os.path.exists(category_file):
-            with open(category_file, "r") as f:
+        if os.path.exists(self.category_file):
+            with open(self.category_file, "r") as f:
                 lines = f.readlines()
                 # Skip header
                 for line in lines[1:]:

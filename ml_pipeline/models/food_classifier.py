@@ -101,27 +101,15 @@ class FoodClassifier:
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
             elif img.shape[2] == 1:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-        elif isinstance(image, (str, Path)):
-            img = cv2.imread(str(image))
+            elif img.shape[2] == 3:
+                if img[0,0,0] > img[0,0,2]:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         elif isinstance(image, Image.Image):
-            img = np.array(image)
+            img = np.array(image.convert("RGB"))
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
-        if image is None:
-            raise ValueError(f"Could not read image from {image}")
-            img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        # Validate numpy array input
-        elif isinstance(image, np.ndarray):
-            if image.shape[2] == 3:
-                img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            if image.ndim != 3 or image.shape[2] != 3:
-                 raise ValueError(f"Invalid image shape: {image.shape}"
-                                  "Expected (H, W, 3) RGB array")
-            if image.dtype != np.uint8:
-                 raise ValueError(f"Invalid dtype: {image.shape}"
-                                  "Expected uint8 (0-255 range)")
-        else:
-            raise TypeError("Input must be path string or numpy array")
+        if image.dtype != np.uint8:
+            raise ValueError("Expected image of dtype uint8 in the 0-255 range")
         # Convert to tensor with explicit channel dimension
         tensor = self.transform(Image.fromarray(img))
         tensor = torch.from_numpy(image).permute(2,0,1).float()/255.0 # CxHxW

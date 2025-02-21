@@ -43,7 +43,8 @@ class UECFoodDataset(Dataset):
         self.fallback_sample = {"image_path":"placeholder.jpg",
                                 "bboxes":[[0,0,100,100]],
                                 "label":0,
-                                "nutrition":NutritionMapper.get_default_nutrition()}
+                                "nutrition":NutritionMapper.get_default_nutrition(),
+                                "portions":0.0}
     async def initialize(self) -> None:
         """Async initialization hook"""
         if self.nutrition_mapper:
@@ -239,11 +240,11 @@ class UECFoodDataset(Dataset):
                     x1, y1, x2, y2 = bboxes[0]
                     bbox_area = (x2-x1)*(y2-y1)
                     portion =  self._estimate_portion(food_name, bbox_area)
+                target.update({"boxes":torch.tensor(yolo_boxes, dtype=torch.float32),
+                               "labels":torch.tensor(labels, dtype=torch.int64),
+                               "portions": torch.tensor([portion], dtype=torch.float32),
+                               "nutrition": nutrition_data})
 
-                    target.update({# "boxes":torch.tensor(yolo_boxes, dtype=torch.float32),
-                                  # "labels":torch.tensor(labels, dtype=torch.int64),
-                                  "portions":torch.tensor([portion], dtype=torch.float32),
-                                  "nutrition":nutrition_data})
             if "nutrition" not in target:
                 target["nutrition"] = torch.zeros(4, dtype=torch.float32)
             if "portions" not in target:
@@ -282,7 +283,7 @@ def collate_fn(batch:Iterable[Tuple[torch.Tensor,
         # Combine labels and boxes into [class_id, x, y, w, h]
         yolotarget = torch.cat([target["labels"].unsqueeze(1),
                                 target["boxes"],
-                                target.get("portion", torch.zeros(1).unsqueeze(1))], dim = 1)
+                                target.get("portions", torch.zeros(1).unsqueeze(1))], dim = 1)
         detection_targets.append(yolotarget)
         nutrition_targets.append(target["nutrition"])
     image = torch.stack(image, dim = 0)

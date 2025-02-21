@@ -157,43 +157,37 @@ class NutritionMapper:
 
     async def map_food_label_to_nutrition(self, food_labels: str) -> Dict[str, float]:
         """Async version with caching and fallback"""
-        session = getattr(self, "session", aiohttp.ClientSession())
-        try:
-            params = {"api_key": self.api_key, "query": food_labels}
-            async with session.get(self.base_url, params=params) as response:
-                  if response.status != 200:
-                      logging.error(f"API Error: {response.status}")
-                      return self.get_default_nutrition()
-                  data = await response.json()
-                  if not data.get("foods"):
-                      return self.get_default_nutrition()
-                  food = data["foods"][0]
-                  return {"calories": food.get("calories",0),
-                          "protein":food.get("protein",0),
-                          "fat":food.get("fat",0),
-                          "carbohydrates":food.get("carbohydrates",0)}
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logging.error(f"Request failed: {str(e)}")
-            return self.get_default_nutrition()
-        finally:
-            if not hasattr(self, "session"):
-                await session.close()
         attempts = 3
+        session = getattr(self, "session", aiohttp.ClientSession())
         for attempt in range(attempts):
             try:
-                nutritions = await self.get_nutrition_data(food_labels)
-                if not nutritions:
-                    logging.warning(f"No nutrition data found for {food_labels}, using default nutrition")
-                    return self.get_default_nutrition()
-                density = self.density_db.get(food_labels.lower(), 0.05)
-                nutritions["calories_per_ml"] = (nutritions["calories"] / 100) * density
-                return nutritions
+                params = {"api_key": self.api_key, "query": food_labels}
+                async with session.get(self.base_url, params=params) as response:
+                      if response.status != 200:
+                          logging.error(f"API Error: {response.status}")
+                          continue
+                      data = await response.json()
+                      if not data.get("foods"):
+                          return self.get_default_nutrition()
+                      food = data["foods"][0]
+                      return {"calories": food.get("calories",0),
+                              "protein":food.get("protein",0),
+                              "fat":food.get("fat",0),
+                              "carbohydrates":food.get("carbohydrates",0)}
+                      nutritions = await self.get_nutrition_data(food_labels)
+                      if not nutritions:
+                          logging.warning(f"No nutrition data found for {food_labels}, using default nutrition")
+                          return self.get_default_nutrition()
+                      density = self.density_db.get(food_labels.lower(), 0.05)
+                      nutritions["calories_per_ml"] = (nutritions["calories"] / 100) * density
+                      return nutritions
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                if attempt == attempts - 1:
-                    logging.error(f"Failed after {attempts} attempts: {e}, Switching to use default nutrition")
+                if attempt == attempts-1:
+                    logging.error(f"Request failed after {attempts} attempts: {str(e)}, Now using default nutrition values")
                     return self.get_default_nutrition()
-                await asyncio.sleep(2 ** attempt)
-
+                await asyncio.sleep(2**attempt)
+            finally:
+                await session.close()
     def get_density(self, food_name:str)->float:
         return self.density_db.get(food_name.lower(), 0.05)
 
