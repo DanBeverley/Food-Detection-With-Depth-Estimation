@@ -203,35 +203,28 @@ class FoodTrainingSystem:
         return list(self.classifier.model.parameters()) + list(self.detector.model.parameters())
     def _forward_pass(self, val_images, val_targets):
         """Forward pass through both models"""
-        numpy_images = val_images.cpu().numpy().transpose(0,2,3,1)
-        detections = self.detector.detect(numpy_images, return_masks=True)
-        class_outputs = self.classifier.model(numpy_images)
-        assert "portions" in targets, "Missing portion data in targets"
-        return self._calculate_loss(
-            class_outputs,
-            val_targets,
-            detections
-        )
+        with torch.no_grad():
+            numpy_images = val_images.cpu().numpy().transpose(0, 2, 3, 1)
+            detections = self.detector.model(val_images)
+        outputs = self.classifier.model(val_images)
+        assert "portion" in outputs, "Missing portion data in targets"
+        assert "nutrition" in outputs, "Missing nutrition output"
+        assert "class" in outputs, "Missing class output"
+        return self._calculate_loss(outputs, val_targets, detections)
 
     def _calculate_loss(self, outputs, val_targets, detections) -> float:
         """Calculate combined loss"""
         weights = self.config_params["training"]["loss_weights"]
-        losses = {
-            "classification": F.cross_entropy(
-                outputs["class"],
-                val_targets["labels"]
-            ),
-            "nutrition": F.mse_loss(
-                outputs["nutrition"],
-                val_targets["nutrition"]
-            ),
-            "portion": F.l1_loss(
-                outputs["portion"],
-                val_targets["portion"]
-            )
-        }
-
-        return sum(weight * loss for loss, weight in zip(losses.values(), weights.values()))
+        cls_loss = F.cross_entropy(outputs["class"], val_targets["labels"])
+        nutrition_loss = F.mse_loss(outputs["nutrition"][:, :3],
+                                    val_targets["nutrition"][:, :3])
+        portion_loss = .7 + F.l1_loss(outputs["portion"], val_targets["portions"]) + \
+                       .3 + F.mse_loss(outputs["portions"], val_targets["portions"])
+        return (
+                weights["classification"] * cls_loss +
+                weights["nutrition"] * nutrition_loss +
+                weights["portion"] * portion_loss
+        )
 
     def _should_start_qat(self, epoch: int) -> bool:
         """Check if QAT should be initialized"""

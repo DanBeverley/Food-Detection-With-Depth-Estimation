@@ -2,6 +2,7 @@ from typing import Optional, List, Union, Dict, Tuple
 
 import torch
 import numpy as np
+from tensorrt_bindings import ExecutionContextAllocationStrategy
 from torch.utils.data import DataLoader
 import pycuda.driver as cuda
 import pycuda.autoinit
@@ -66,25 +67,30 @@ class FoodDetector:
             if Path("yolov8.trt").exists():
                 self.trt_logger = trt.Logger(trt.Logger.WARNING)
                 self.trt_engine = self._load_trt_engine()
-                self.context = self.trt_engine.create_execution_context
+                self.context = self.trt_engine.create_execution_context(strategy=ExecutionContextAllocationStrategy)
+                self.input_shape = self.trt_engine.get_binding_shape(0)
                 self._allocate_buffers()
+                logging.info("TensorRT engine loaded successfully")
             else:
-                self.build_trt_engine()
                 logging.warning("TensorRT engine not found, using Pytorch model")
+                self.build_trt_engine()
+                self._setup_tensorrt()
         except Exception as e:
             logging.error(f"TensorRT setup failed: {e}")
             self.trt_engine = None
-            self.stream = cuda.Stream()
-            self.bindings = []
+            self.context = None
             self.inputs = []
             self.outputs = []
-            self.input_shape = (3, 640, 640)
 
     def __del__(self) -> None:
-        if self.context:
-            self.context.__del__()
+        """Safe cleaning of CUDA resources"""
         if self.trt_engine:
-            self.trt_engine.__del__()
+            del self.trt_engine
+        if self.context:
+            del self.context
+        for buf in self.inputs + self.outputs:
+            if self.device in buf:
+                cuda.memfree(buf["device"])
 
     def detect_batch(self, images:Union[str, np.ndarray], batch_size:int=32) -> List[Dict[str, Union[List, float, int]]]:
         """Process images in batches"""

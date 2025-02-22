@@ -121,6 +121,10 @@ class NutritionMapper:
     @staticmethod
     def _parse_nutrition_data(food_item: Dict[str, Any]) -> Dict[str, float]:
         """Parse nutrition data from USDA API response"""
+        NUTRITION_IDS = {"calories":1008,
+                         "protein":1003,
+                         "fat":1004,
+                         "carbohydrates":1005}
         nutritions = {
             "calories": 0,
             "protein": 0,
@@ -129,18 +133,19 @@ class NutritionMapper:
         }
 
         for nutrient in food_item.get("foodNutrients", []):
-            name = nutrient.get("nutrientName", "").lower()
-            value = nutrient.get("value", 0)
-
-            if "calorie" in name:
-                nutritions["calories"] = value
-            elif "protein" in name:
-                nutritions["protein"] = value
-            elif "fat" in name:
-                nutritions["fat"] = value
-            elif "carbohydrate" in name:
-                nutritions["carbohydrates"] = value
-
+            nutrient_id = nutrient.get("nutrientId")
+            amount = nutrient.get("amount", 0)
+            if nutrient_id == NUTRITION_IDS["calories"]:
+                nutritions["calories"] = float(amount)
+            elif nutrient_id == NUTRITION_IDS["protein"]:
+                nutrient["protein"] = float(amount)
+            elif nutrient_id == NUTRITION_IDS["fat"]:
+                nutrition["fat"] = float(amount)
+            elif nutrient_id == NUTRITION_IDS["carbohydrates"]:
+                nutrition["carbohydrates"] = float(amount)
+        if sum(nutritions.values())==0:
+            logging.warning(f"No nutrition data found for food item: {food_item.get('description')}")
+            return NutritionMapper.get_default_nutrition()
         return nutritions
 
     def _cache_data(self, key: str, nutritions: Dict[str, float]) -> None:

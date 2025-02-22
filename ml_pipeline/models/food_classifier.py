@@ -108,12 +108,14 @@ class FoodClassifier:
             img = np.array(image.convert("RGB"))
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
-        if image.dtype != np.uint8:
+        if img.dtype != np.uint8:
             raise ValueError("Expected image of dtype uint8 in the 0-255 range")
+            img = (img*255).astype(np.uint8)
         # Convert to tensor with explicit channel dimension
         tensor = self.transform(Image.fromarray(img))
         tensor = torch.from_numpy(image).permute(2,0,1).float()/255.0 # CxHxW
         if tensor.shape[0]!=3:
+            tensor = tensor[:3] # Force 3 channels
             raise ValueError(
                 f"Invalid channel dimension: {tensor.shape[0]}"
                 "Expected 3-channel RGB image"

@@ -17,13 +17,15 @@ class MultiTaskFoodNet(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.5)
         )
-
         self.class_head = nn.Sequential(
             nn.Linear(1024, 512),
             nn.ReLU(),
             nn.Linear(512, num_classes)
         )
-
+        self.portion_head = nn.Sequential(nn.Linear(1024, 256),
+                                          nn.ReLU(),
+                                          nn.Linear(256, 1),
+                                          nn.Sigmoid())
         self.nutrition_head = create_multitask_head(1024)
 
         # Initialize scaling factors as registered buffers instead of parameters
@@ -49,7 +51,8 @@ class MultiTaskFoodNet(nn.Module):
                 torch.clamp(nutrition[:, 3],0 , 100) # Carbs Percentage
             ], dim = 1)
             return {"class":self.class_head(shared),
-                    "nutrition":nutrition}
+                    "nutrition":nutrition,
+                    "portion": self.portion_head(shared).squeeze()}
         except RuntimeError as e:
             logging.error(f"Forward pass failed: {e}")
             raise
