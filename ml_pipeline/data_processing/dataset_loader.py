@@ -178,10 +178,6 @@ class UECFoodDataset(Dataset):
                 mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
                 mask = (mask>127).astype(np.float32) # Convert to binary float mask
                 item["mask"] = mask
-
-            if mask is not None and not isinstance(mask, np.ndarray):
-                raise ValueError(f"Invalid mask type: {type(mask)}")
-
             # Load the image using OpenCV and convert BGR to RGB
             image = cv2.imread(item["image_path"])
             if image is None:
@@ -190,17 +186,23 @@ class UECFoodDataset(Dataset):
                 logging.warning(f"Missing nutrition data for {item['label']}")
                 item["nutrition"] = self.nutrition_mapper.get_default_nutrition()
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
             bboxes = item["bboxes"]
             labels = [item["label"]]*len(bboxes)
 
-
             if self.transform:
-                transformed = self.transform(image=image, bboxes=bboxes, labels=labels)
-                image = transformed["image"]
-                bboxes = transformed["bboxes"] # Transformed PascalVoc
-                labels = transformed["labels"]
-
+                if "mask" in item:
+                    transformed = self.transform(image=image, bboxes=bboxes, labels=labels, mask=item["mask"])
+                    image = transformed["image"]
+                    bboxes = transformed["bboxes"] # Transformed PascalVoc
+                    labels = transformed["labels"]
+                    mask = transformed["mask"]
+                else:
+                    transformed = self.transform(image=image, bboxes=bboxes, labels=labels)
+                    image = transformed["image"]
+                    bboxes = transformed["bboxes"]
+                    labels = transformed["labels"]
+            else:
+                mask = item.get("mask")
             # Convert to YOLO format (normalized x,y,w,h)
             height, width = image.shape[1], image.shape[2] # Transformed image shape (C,H,W)
             yolo_boxes = []
@@ -210,59 +212,37 @@ class UECFoodDataset(Dataset):
                 w = (x2-x1)/width
                 h = (y2-y1)/height
                 yolo_boxes.append([x_center, y_center, w, h])
-
-            target = {"boxes":torch.tensor(yolo_boxes, dtype = torch.float32), # Shape: [num_boxes,4]
-                      "labels":torch.tensor(labels, dtype = torch.int64),      # Shape: [num_boxes]
-                      }
-
-            # Portion estimation calculations
-            nutrition_data = torch.zeros(4, dtype=torch.float32) # [cal, prot, fat, carbs]
-
-            if self.nutrition_mapper:
-                food_name = self.id_to_category.get(item["label"], "unknown")
-                try:
-                    # nutrition = self.nutrition_mapper.get_nutrition_data(food_name)
-                    nutrition = self.nutrition_cache.get(food_name,
-                                                         self.nutrition_mapper.get_default_nutrition())
-                except(KeyError, ConnectionError) as e:
-                    logging.warning(f"Nutrition data unavailable for {food_name}: {e}")
-                    nutrition = self.nutrition_mapper.get_default_nutrition()
-                nutrition_data = torch.tensor([nutrition.get("calories",0),
-                                               nutrition.get("protein",0),
-                                               nutrition.get("fat",0),
-                                               nutrition.get("carbohydrates",0)],
-                                              dtype=torch.float32)
-                if 'mask' in item:
-                    mask_area = np.sum(item["mask"])
+            # Nutrition data
+            food_name = self.id_to_category.get(item["label"], "unknown")
+            nutrition = self.nutrition_cache.get(food_name,
+                                                 self.nutrition_mapper.get_default_nutrition())
+            nutrition_data = torch.tensor([nutrition.get("calories",0),
+                                           nutrition.get("protein",0),
+                                           nutrition.get("fat",0),
+                                           nutrition.get("carbohydrates",0)],
+                                          dtype=torch.float32)
+            # Portion calculation after transformation
+            portions = []
+            if mask is not None:
+                for x1, y1, x2, y2 in bboxes:
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    mask_crop = mask[y1:y2, x1:x2]
+                    mask_area = np.sum(mask_crop)
                     portion = self._estimate_portion(food_name, mask_area)
-                else:   # Fallback to bbox area
-                    # Calculate area based portion estimation
-                    x1, y1, x2, y2 = bboxes[0]
-                    bbox_area = (x2-x1)*(y2-y1)
-                    portion =  self._estimate_portion(food_name, bbox_area)
-                target.update({"boxes":torch.tensor(yolo_boxes, dtype=torch.float32),
-                               "labels":torch.tensor(labels, dtype=torch.int64),
-                               "portions": torch.tensor([portion], dtype=torch.float32),
-                               "nutrition": nutrition_data})
-
-            if "nutrition" not in target:
-                target["nutrition"] = torch.zeros(4, dtype=torch.float32)
-            if "portions" not in target:
-                target["portions"] = torch.zeros(1, dtype=torch.float32)
-            if "mask" in item:
-                transformed = self.transform(image=image, bboxes=bboxes, labels=labels,
-                                             mask=item["mask"])
-                mask = transformed["mask"]
+                    portions.append(portion)
             else:
-                transformed = self.transform(image=image, bboxes=bboxes, labels=labels)
-            target["mask"] = mask if mask is not None else torch.zeros(1)
-
+                for x1, y1, x2, y2 in bboxes:
+                    bbox_area = (x2-x1)*(y2-y1)
+                    portion = self._estimate_portion(food_name, bbox_area)
+                    portions.append(portion)
+            target = {"bboxes":torch.tensor(yolo_boxes, dtype=torch.float32),
+                      "labels":torch.tensor(labels, dtype=torch.int64),
+                      "portions":torch.tensor(portions, dtype=torch.float32),
+                      "nutritions":nutrition_data}
             return image, target
         except Exception as e:
             logging.error(f"Failed to load sample {idx}: {str(e)}")
             return self._get_fallback_sample()
-
-
 
     def _estimate_portion(self, food_name:str, bbox_area:float) -> float:
         """Estimate portion (volume in ml) using food-specific density per pixel area"""
@@ -281,9 +261,9 @@ def collate_fn(batch:Iterable[Tuple[torch.Tensor,
     for img, target in batch:
         image.append(img)
         # Combine labels and boxes into [class_id, x, y, w, h]
-        yolotarget = torch.cat([target["labels"].unsqueeze(1),
-                                target["boxes"],
-                                target.get("portions", torch.zeros(1).unsqueeze(1))], dim = 1)
+        yolotarget = torch.cat([target["labels"].unsqueeze(1),      # [num_boxes, 1]
+                                target["boxes"],                            # [num_boxes, 4]
+                                target["portions"].unsqueeze(1)], dim = 1)  # [num_boxes, 1]
         detection_targets.append(yolotarget)
         nutrition_targets.append(target["nutrition"])
     image = torch.stack(image, dim = 0)
