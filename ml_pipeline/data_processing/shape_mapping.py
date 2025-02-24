@@ -25,7 +25,11 @@ class ShapePrior:
 class UEC256ShapeMapper:
     def __init__(self):
         self.category_map = self._initialize_category_map()
-        assert "default" in self.category_map, "Missing default shape prior"
+        if "default" not in self.category_map:
+            logging.warning("Default shape prior is missing in category_map")
+            self.category_map["default"] = ShapePrior(shape=FoodShape.IRREGULAR,
+                                                      height_ratio=0.5, volume_modifier=0.85,
+                                                      typical_serving_cm3 = None)
     @staticmethod
     def _initialize_category_map()->Dict[str, ShapePrior]:
         """Initialize shape mapping for UEC-256 food categories.
@@ -347,26 +351,32 @@ class UEC256ShapeMapper:
         """Get shape prior for a given food category"""
         # Clean the input category string
         category = food_category.lower().strip().replace(" ","_")
-        return self.category_map.get(category, self.category_map["default"])
+        prior = self.category_map.get(category)
+        if prior is None:
+            logging.info(f"No shape prior found for '{food_category}', using default")
+            prior = self.category_map["default"]
+        return prior
 
     def add_custom_category(self, category:str, shape:FoodShape,
                             height_ratio:float, volume_modifier:float,
                             typical_serving_cm3:Optional[float] = None,
-                            sub_components:Optional[List[str]] = None)->None:
+                            sub_components:Optional[List[str]] = None) -> None:
         """Add a custom food category with its shape prior"""
+        category = category.lower().strip().replace(" ", "_")
+        if category in self.category_map:
+            logging.warning(f"Overwritting existing category '{category}'")
         self.category_map[category] = ShapePrior(shape = shape,
                                                  height_ratio = height_ratio,
                                                  volume_modifier = volume_modifier,
                                                  typical_serving_cm3 = typical_serving_cm3,
                                                  sub_components = sub_components)
 
-    def get_similar_categories(self, food_category:str)->List[str]:
+    def get_similar_categories(self, food_category:str, threshold:float=0.2)->List[str]:
         """Find similar food categories based on shape categories"""
         target_prior = self.get_shape_prior(food_category)
         similar_categories = []
-
         for category, prior in self.category_map.items():
             if (prior.shape == target_prior.shape and
-                    abs(prior.height_ratio-target_prior.height_ratio)<0.2):
+                    abs(prior.height_ratio-target_prior.height_ratio)<threshold):
                 similar_categories.append(category)
         return similar_categories

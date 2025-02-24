@@ -1,8 +1,8 @@
+import json
 import logging
 import csv
 import os
 import asyncio
-import socket
 
 import aiohttp
 from redis import Redis, ConnectionError as RedisConnectionError
@@ -54,20 +54,17 @@ class NutritionMapper:
     async def get_nutrition_data(self, query: str, max_results: int = 1) -> Optional[Dict[str, float]]:
         """Async version of the USDA API call with Redis caching"""
         cache_key = f"nutrition:{query.lower()}"
-
         # Try Redis cache first
         if self.redis:
             try:
-                cached = self.redis.hgetall(cache_key)
+                cached = self.redis.get(cache_key)
                 if cached:
-                    return {k: float(v) for k, v in cached.items()}
+                    return json.loads(cached)
             except RedisConnectionError:
                 pass
-
         # Try local cache
         if query.lower() in self.cache:
             return self.cache[query.lower()]
-
         # API call with retry logic
         params = {
             "api_key": self.api_key,
@@ -79,44 +76,9 @@ class NutritionMapper:
                 data = await response.json()
                 if "foods" in data and len(data["foods"])>0:
                     nutritions = self._parse_nutrition_data(data["foods"][0])
-                    self._cache_data(cache_key, nutritions)
+                    self._cache_data(query, nutritions)
                     return nutritions
               return None
-
-    @staticmethod
-    def _validate_nutrition_values(nutritions: Dict) -> Dict:
-        """Validate and clean nutrition values"""
-        cleaned = {}
-        for key, value in nutritions.items():
-            try:
-                cleaned[key] = float(value)
-                if cleaned[key] < 0:
-                    cleaned[key] = 0
-                    logging.warning(f"Negative value found for {key}, set to 0")
-            except (ValueError, TypeError):
-                logging.warning(f"Invalid value for {key}: {value}")
-                cleaned[key] = 0
-        return cleaned
-
-    async def _api_call_with_retry(self, url: str, params: Dict[str, Any],
-                                   max_retries: int = 3) -> Optional[Dict[str, Any]]:
-        for attempt in range(max_retries):
-            try:
-                async with self.session.get(url, params=params) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    elif response.status == 429:  # Rate limit
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-            except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError, socket.gaierror, asyncio.CancelledError) as e:
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(2 ** attempt)
-                logging.warning(f"Request failed: {e}. Retrying (attempt {attempt+1}/{max_retries})...")
-            except Exception as e:
-                logging.warning(f"Unexpected error occured: {e}")
-                raise
-        return None
 
     @staticmethod
     def _parse_nutrition_data(food_item: Dict[str, Any]) -> Dict[str, float]:
@@ -131,10 +93,9 @@ class NutritionMapper:
             "fat": 0,
             "carbohydrates": 0
         }
-
         for nutrient in food_item.get("foodNutrients", []):
             nutrient_id = nutrient.get("nutrientId")
-            amount = nutrient.get("amount", 0)
+            amount = nutrient.get("value", 0)
             if nutrient_id == NUTRITION_IDS["calories"]:
                 nutritions["calories"] = float(amount)
             elif nutrient_id == NUTRITION_IDS["protein"]:
@@ -150,49 +111,25 @@ class NutritionMapper:
 
     def _cache_data(self, key: str, nutritions: Dict[str, float]) -> None:
         """Cache data in both Redis and local cache"""
-        self.cache[key.split(":")[1]] = nutritions
-
+        self.cache[key.lower()] = nutritions
         if self.redis is not None:
             try:
                 # Store with 24-hour TTL
-                self.redis.hset(key, mapping=nutritions)
-                self.redis.expire(key, 86400)
+                cache_key = f"nutrition:{key.lower()}"
+                self.redis.set(cache_key, json.dumps(nutritions))
+                self.redis.expire(cache_key, 86400)
             except RedisConnectionError:
                 pass
 
     async def map_food_label_to_nutrition(self, food_labels: str) -> Dict[str, float]:
         """Async version with caching and fallback"""
-        attempts = 3
-        session = getattr(self, "session", aiohttp.ClientSession())
-        for attempt in range(attempts):
-            try:
-                params = {"api_key": self.api_key, "query": food_labels}
-                async with session.get(self.base_url, params=params) as response:
-                      if response.status != 200:
-                          logging.error(f"API Error: {response.status}")
-                          continue
-                      data = await response.json()
-                      if not data.get("foods"):
-                          return self.get_default_nutrition()
-                      food = data["foods"][0]
-                      return {"calories": food.get("calories",0),
-                              "protein":food.get("protein",0),
-                              "fat":food.get("fat",0),
-                              "carbohydrates":food.get("carbohydrates",0)}
-                      nutritions = await self.get_nutrition_data(food_labels)
-                      if not nutritions:
-                          logging.warning(f"No nutrition data found for {food_labels}, using default nutrition")
-                          return self.get_default_nutrition()
-                      density = self.density_db.get(food_labels.lower(), 0.05)
-                      nutritions["calories_per_ml"] = (nutritions["calories"] / 100) * density
-                      return nutritions
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                if attempt == attempts-1:
-                    logging.error(f"Request failed after {attempts} attempts: {str(e)}, Now using default nutrition values")
-                    return self.get_default_nutrition()
-                await asyncio.sleep(2**attempt)
-            finally:
-                await session.close()
+        nutritions = await self.get_nutrition_data(food_labels)
+        if not nutritions:
+          logging.warning(f"No nutrition data found for {food_labels}, using default nutrition")
+          return self.get_default_nutrition()
+        density = self.density_db.get(food_labels.lower(), 0.05)
+        nutritions["calories_per_ml"] = (nutritions["calories"] / 100) * density
+        return nutritions
     def get_density(self, food_name:str)->float:
         return self.density_db.get(food_name.lower(), 0.05)
 

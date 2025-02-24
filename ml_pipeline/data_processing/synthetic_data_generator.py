@@ -33,11 +33,14 @@ class FoodGANDataset(Dataset):
                             if p.stem in self.mask_paths]
         if not self.image_paths:
             raise ValueError(f"No matching images found in {image_dir}")
+        missing_masks = len(list(self.image_dir.rglob(f"*{image_ext}"))) - len(self.image_paths)
+        if missing_masks > 0:
+            logging.warning(f"Found {missing_masks} images without corresponding masks")
     def __len__(self):
         return len(self.image_paths)
     def __getitem__(self, idx):
         img = cv2.imread(str(self.image_paths[idx]))
-        mask = cv2.imread(str(self.mask_paths[self.image_paths[idx].stem]))
+        mask = cv2.imread(str(self.mask_paths[self.image_paths[idx].stem]), cv2.IMREAD_GRAYSCALE)
         return self.transform(image=np.array(img), mask = np.array(mask))
 
 class Generator(nn.Module):
@@ -91,7 +94,6 @@ class Discriminator(nn.Module):
             nn.BatchNorm2d(ndf * 8),
             nn.LeakyReLU(0.2, inplace=True),
             spectral_norm(nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False)),
-            nn.Sigmoid()  # Even though WGAN-GP usually doesn't use Sigmoid, here we add gradient penalty on top of BCE.
         )
     def forward(self, x:torch.Tensor)->torch.Tensor:
         return self.main(x).view(-1)
@@ -120,7 +122,7 @@ def compute_gradient_penalty(D:nn.Module, real_samples:torch.Tensor,
 class GANTrainer:
     def __init__(self, device:torch.cuda.device, nz:int=100, lr:float=0.0002,
                  beta1:float=0.5, nutrition_mapper = None):
-        self.device = device
+        self.device = device if torch.cuda.is_available() else torch.device("cpu")
         self.nz = nz
         self.nutrition_mapper = nutrition_mapper
         self.netG = Generator(nz = nz).to(device=device)
@@ -128,7 +130,6 @@ class GANTrainer:
 
         self.optimG = optim.Adam(self.netG.parameters(), lr=lr, betas=(beta1, 0.999))
         self.optimD = optim.Adam(self.netD.parameters(), lr=lr, betas=(beta1, 0.999))
-        self.criterion = nn.BCEWithLogitsLoss()
 
         self.schedulerG = optim.lr_scheduler.ReduceLROnPlateau(self.optimG, "min", patience = 5)
         self.schedulerD = optim.lr_scheduler.ReduceLROnPlateau(self.optimD, "min", patience = 5)
@@ -191,9 +192,6 @@ class GANTrainer:
         if generation_params is None:
             generation_params = {}
         # Generate realistic portion estimates based on food type
-        fake_label = "synthetic_food"
-        nutrition = self.nutrition_mapper.map_food_label_to_nutrition(fake_label)
-
         bbox_area = np.random.randint(500,2000)
         density = self.nutrition_mapper.get_density(fake_label) if self.nutrition_mapper else 0.8
         portion = bbox_area * density
@@ -202,7 +200,7 @@ class GANTrainer:
         row_data = {
             "epoch": epoch,
             "sample_filename": sample_filename,
-            "synthetic": True,
+            "synthetic": "True",
             "calories_estimate": round(calories, 2),
             "food_type": fake_label,
             "portion_size": round(portion, 2),
@@ -247,15 +245,15 @@ class GANTrainer:
         with autocast():
             # Real images
             output_real = self.netD(real_imgs)
-            loss_real = self.criterion(output_real, real_labels)
+            loss_real = -output_real.mean()
             # Fake images
             noise = torch.randn(batch_size, self.nz, 1, 1, device=self.device)
             fake_imgs = self.netG(noise)
             output_fake = self.netD(fake_imgs.detach())
-            loss_fake = self.criterion(output_fake, fake_labels)
+            loss_fake = output_fake.mean()
             # Gradient penalty
             gp = compute_gradient_penalty(self.netD, real_imgs, fake_imgs, self.device, lambda_gp=10.0)
-            loss_D = (loss_real + loss_fake)*0.5 + gp * 10.0
+            loss_D = loss_real + loss_fake + gp * 10.0
         # Mixed precision backward pass for discriminator
         self.scaler.scale(loss_D).backward()
         self.scaler.step(self.optimD)
@@ -263,8 +261,7 @@ class GANTrainer:
         self.netG.zero_grad()
         with autocast():
             output = self.netD(fake_imgs)
-            loss_G = self.criterion(output, real_labels)
-
+            loss_G = -output.mean()
         self.scaler.scale(loss_G).backward()
         self.scaler.step(self.optimG)
         self.scaler.update()
@@ -305,6 +302,8 @@ class GANTrainer:
         # Log gradient penalty
         if 'GP' in losses:
             self.writer.add_scalar('step/gradient_penalty', losses['GP'], batch_idx)
+        self.writer.add_histogram("Generator/conv1_weight", self.netG.main[0].weight, batch_idx)
+        self.writer.add_histogram("Discriminator/conv1_weight", self.netD.main[0].weight, batch_idx)
 
     def _log_epoch(self, epoch: int, epoch_losses: dict):
         """
@@ -359,6 +358,7 @@ class GANTrainer:
             'D_state_dict': self.netD.state_dict(),
             'optimG_state_dict': self.optimG.state_dict(),
             'optimD_state_dict': self.optimD.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict()
         }
         path = f"checkpoint_epoch_{epoch}.pt"
         torch.save(checkpoint, path)
