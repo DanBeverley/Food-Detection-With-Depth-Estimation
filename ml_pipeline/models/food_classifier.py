@@ -48,7 +48,8 @@ class FoodClassifier:
     def __init__(self, model_path:Optional[str]=None, num_classes:int=256,
                  device:Optional[torch.device] = None, quantized:bool = False,
                  active_learner:Optional[ActiveLearner] = None, label_smoothing:float=0.1,
-                 calories_scale:int = 500, protein_scale:int = 100) -> None:
+                 calories_scale:int = 500, protein_scale:int = 100,
+                 class_loss_weight:float=0.7, nutrition_loss_weight:float=0.3) -> None:
         """
         Initialize food classifier with MobileNetV3
         Args:
@@ -56,6 +57,8 @@ class FoodClassifier:
             num_classes: Number of food classes
             device: Device to run model on
         """
+        self.class_loss_weight = class_loss_weight
+        self.nutrition_loss_weight = nutrition_loss_weight
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type=="cuda"))
 
@@ -85,8 +88,14 @@ class FoodClassifier:
                                              transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                                                   std = [0.229, 0.224, 0.225])])
 
-    def preprocess_image(self, image:Union[str, Path, np.ndarray, Image.Image]) -> Tensor:
-        """Preprocess image for classification"""
+    def preprocess_image(self, image:Union[str, Path, np.ndarray, Image.Image],
+                         color_format:str="RGB") -> Tensor:
+        """Preprocess image for classification
+           Args:
+                image: Input image (path, numpy array, or PIL Image).
+                color_format: Color format of numpy array input ("RGB" or "BGR"). Default is "RGB".
+           Returns:
+                Preprocessed tensor."""
         # Handle different input types
         if isinstance(image, (str, Path)):
             img = cv2.imread(str(image))
@@ -95,25 +104,26 @@ class FoodClassifier:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         elif isinstance(image, np.ndarray):
             img = image.copy()
+            if img.dtype != np.uint8:
+                raise ValueError("Expected image of dtype uint8 in the 0-255 range")
             if img.ndim == 2:
+                import warnings
+                warnings.warn("Grayscale image detected. Converting to RGB, but model may expect color images.")
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
             elif img.shape[2] == 4:
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
             elif img.shape[2] == 1:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
             elif img.shape[2] == 3:
-                if img[0,0,0] > img[0,0,2]:
+                if color_format == "BGR":
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         elif isinstance(image, Image.Image):
             img = np.array(image.convert("RGB"))
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
-        if img.dtype != np.uint8:
-            raise ValueError("Expected image of dtype uint8 in the 0-255 range")
             img = (img*255).astype(np.uint8)
         # Convert to tensor with explicit channel dimension
         tensor = self.transform(Image.fromarray(img))
-        tensor = torch.from_numpy(image).permute(2,0,1).float()/255.0 # CxHxW
         if tensor.shape[0]!=3:
             tensor = tensor[:3] # Force 3 channels
             raise ValueError(
@@ -161,13 +171,20 @@ class FoodClassifier:
     def get_uncertain_samples(self, pool_loader:DataLoader, top_k:int=100) -> List[Any]:
         """Identify top-k most uncertain samples"""
         uncertainties = []
+        indices = []
         with torch.inference_mode():
-            for images, _ in pool_loader:
+            for batch_idx, (images, _) in enumerate(pool_loader):
                 outputs = self.model(images.to(self.device))
                 probs = F.softmax(outputs, dim=1)
-                uncertainties.extend((-probs*torch.log2(probs)).sum(dim=1).cpu().numpy()) # Entropy
-        indices = np.argsort(uncertainties)[-top_k:]
-        return [self.unlabeled_pool[i] for i in indices]
+                batch_uncertainties = (-probs * torch.log2(probs + 1e-10)).sum(dim=1).cpu().numpy()
+                uncertainties.extend(batch_uncertainties)
+                batch_indices = list(range(batch_idx * pool_loader.batch_size,
+                                           min((batch_idx + 1) * pool_loader.batch_size,
+                                               len(pool_loader.dataset))))
+                indices.extend(batch_indices)
+        sorted_indices = np.argsort(uncertainties)[-top_k:]
+        selected_indices = [indices[i] for i in sorted_indices]
+        return [pool_loader.dataset[i] for i in selected_indices]
 
     def active_learning_step(self, pool_loader:DataLoader, human_labeler:Callable) -> None:
         # 1. Get uncertain samples
@@ -215,8 +232,8 @@ class FoodClassifier:
                                            class_criterion, nutrition_criterion)
 
             # Validation
-            val_loss, val_accuracy = self._validate_epoch(val_loader, class_criterion)
-
+            val_class_loss, val_nutrition_loss, val_accuracy = self._validate_epoch(val_loader, class_criterion, nutrition_criterion)
+            val_loss = self.class_loss_weight*val_class_loss+self.nutrition_loss_weight*val_nutrition_loss
             # Update learning rate
             scheduler.step(val_loss)
 
@@ -227,7 +244,9 @@ class FoodClassifier:
 
             print(f"Epoch {epoch + 1}/{epochs}:")
             print(f"Train Loss: {train_loss:.4f}")
-            print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%")
+            print(f"Val Class Loss: {val_class_loss:.4f} |"
+                  f"Val Nutrition Loss: {val_nutrition_loss:.4f} |"
+                  f"Val Accuracy: {val_accuracy:.2f}%")
 
     def _train_epoch(self, train_loader:DataLoader, optimizer:torch.optim.Optimizer,
                      class_criterion: Callable[[Tensor, Tensor], Tensor],
@@ -243,8 +262,8 @@ class FoodClassifier:
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
                 outputs = self.model(images)
-                loss = (0.7 * class_criterion(outputs["class"], labels) +
-                        0.3 * nutrition_criterion(outputs["nutrition"], nutrition))
+                loss = (self.class_loss_weight * class_criterion(outputs["class"], labels) +
+                        self.nutrition_loss_weight * nutrition_criterion(outputs["nutrition"], nutrition))
             self.scaler.scale(loss).backward()
             self.scaler.step(optimizer)
             self.scaler.update()
@@ -253,27 +272,31 @@ class FoodClassifier:
 
         return total_loss / len(train_loader)
 
-    def _validate_epoch(self, val_loader:DataLoader,
-                        criterion:Callable[[Tensor, Tensor], Tensor]) -> Tuple[float, float]:
+    def _validate_epoch(self, val_loader:DataLoader, class_criterion:Callable[[Tensor, Tensor], Tensor],
+                        nutrition_criterion:Callable[[Tensor, Tensor], Tensor]) -> Tuple[float, float, float]:
         self.model.eval()
-        total_loss = 0
+        total_class_loss = 0
+        total_nutrition_loss = 0
         correct = 0
         total = 0
-
         with torch.inference_mode():
             for images, (labels, nutrition) in val_loader:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
-
+                nutrition = nutrition.to(self.device)
                 outputs = self.model(images)
-                loss = criterion(outputs["class"], labels)
+                class_loss = class_criterion(outputs["class"], labels)
+                nutrition_loss = nutrition_criterion(outputs["nutrition"], nutrition)
 
-                total_loss += loss.item()
+                total_class_loss += class_loss.item()
+                total_nutrition_loss += nutrition_loss.item()
                 _, predicted = outputs["class"].max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
-
-        return total_loss / len(val_loader), 100. * correct / total
+        avg_class_loss = total_class_loss/len(val_loader)
+        avg_nutrition_loss = total_nutrition_loss/len(val_loader)
+        accuracy = 100.*correct/total
+        return avg_class_loss, avg_nutrition_loss, accuracy
 
 
 

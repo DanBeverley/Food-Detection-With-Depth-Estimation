@@ -27,24 +27,20 @@ class FoodDetector:
        """
         self.conf_threshold = confidence
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-
+        self.use_trt = False # Flag to indicate TensorRT usage
         try:
             self.model = YOLO(model_path if model_path and Path(model_path).exists() else "yolov8n.pt")
             self.model.to(self.device)
         except Exception as e:
             logging.error(f"Error loading model: {e}")
             raise
-
         # Quantization
         if quantized:
             self.quantize()
-
         # Half precision optimization
         if half_precision and torch.cuda.is_available() and device.type == "cuda":
             self.model = self.model.half()
-
         self._setup_tensorrt()
-
     def _load_trt_engine(self) -> trt.ICudaEngine:
         """Load pre-built TensorRT engine"""
         with open("yolov8.trt", "rb") as f, trt.Runtime(self.trt_logger) as runtime:
@@ -74,10 +70,12 @@ class FoodDetector:
             else:
                 logging.warning("TensorRT engine not found, using Pytorch model")
                 self.build_trt_engine()
-                self._setup_tensorrt()
         except Exception as e:
             logging.error(f"TensorRT setup failed: {e}")
             self.trt_engine = None
+            self.stream = cuda.Stream()
+            self.bindings = []
+            self.input_shape = (3, 640, 640)
             self.context = None
             self.inputs = []
             self.outputs = []
@@ -96,26 +94,27 @@ class FoodDetector:
         """Process images in batches"""
         results = []
         for i in range(0, len(images), batch_size):
-            batch = images[i:i+batch_size]
-            batch_results = self.model(batch, conf=self.conf_threshold)
-            results.extend(self._process_results(batch_results, return_masks=False, original_shape=(640,640)))
+            batch = images[i:i + batch_size]
+            batch_results = self.model(batch, conf=self.conf_threshold, verbose=False)
+            for result, img in zip(batch_results, batch):
+                original_shape = img.shape[:2] if isinstance(img, np.ndarray) else cv2.imread(img).shape[:2]
+                processed = self._process_results(result, return_masks=False, original_shape=original_shape)
+                results.extend(processed)
         return results
 
     @staticmethod
-    def preprocess_image(image:Union[str, np.ndarray]) -> np.ndarray:
+    def preprocess_image(image:Union[str, np.ndarray], color_format:str="RGB") -> np.ndarray:
         """Preprocess image for YOLO model"""
-        if isinstance(image, np.ndarray):
+        if isinstance(image, str):
+            image = cv2.imread(image)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        elif isinstance(image, np.ndarray):
             if image.dtype != np.uint8:
                 raise ValueError(f"Invalid dtype: {image.dtype}, expected uint8")
             if image.max() > 255 or image.min() < 0:
                 raise ValueError("Image values out of [0, 255] range")
-        if isinstance(image, str):
-            image = cv2.imread(image)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        elif isinstance(image, np.ndarray) and image.ndim == 3:
-            if image.shape[2] == 3 and image.dtype == np.uint8:
-                if image[0,0,0] > image[0,0,2]: # Crude BGR check
-                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            if image.ndim == 3 and image.shape[2] == 3 and color_format == "BGR":
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         else:
             raise ValueError("Image must be a path string or numpy array")
         return image
@@ -147,34 +146,49 @@ class FoodDetector:
         """
         if isinstance(image, torch.Tensor):
             image = image.cpu().numpy().transpose(1,2,0)
-        image = self.preprocess_image(image)
-
-        # Run inference
-        results = self.model(image, conf = self.conf_threshold,
-                             verbose=False, device=self.device)
-        return self._process_results(results, return_masks, image.shape[:2])
-
+        if self.use_trt:
+            return self._infer_trt(image, return_masks)
+        else:
+            image = self.preprocess_image(image)
+            # Run inference
+            results = self.model(image, conf = self.conf_threshold,
+                                verbose=False, device=self.device)
+            return self._process_results(results, return_masks, image.shape[:2])
+    def _infer_trt(self, image:Union[str, np.ndarray], return_masks:bool) -> List[Dict[str, Union[np.ndarray, float, int]]]:
+        # Placeholder for TensorRT inference
+        preprocessed = self._preprocess(image)
+        # Copy preprocessed image to device memory
+        np.copyto(self.inputs[0]["host"], preprocessed.ravel())
+        cuda.memcpy_htod_async(self.inputs[0]["device"], self.inputs[0]["host"], self.stream)
+        # Execute inference
+        self.context.execute_async_v2(bindings=self.bindings, stream_handle = self.stream.handle)
+        for output in self.outputs:
+            cuda.memcpy_dtoh_async(output["host"], output["device"], self.stream)
+        self.stream.synchronize()
+        return []
     @staticmethod
-    def _process_results(results:List, return_masks:bool,
+    def _process_results(results, return_masks:bool,
                          original_shape:Tuple) -> List[Dict[str, Union[np.ndarray, float, int]]]:
         # Process results
         detections = []
-        for result in results:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            # Masks if available
-            masks = result.masks if hasattr(result, "masks") else None
+        # YOLOv8 returns a single Results object for one image
+        boxes = results.boxes.xyxy.cpu().numpy()
+        confs = results.boxes.conf.cpu().numpy()
+        classes = results.boxes.cls.cpu().numpy()
+        masks = results.masks if return_masks and hasattr(results, "masks") else None
 
-            for i, box in enumerate(boxes):
-                detection = {"bbox":box,
-                             "confidence": float(result.boxes.conf[i]),
-                             "class_id":int(result.boxes.cls[i])}
-                if return_masks and masks:
-                    # Convert mask to original image dimensions
-                    mask = masks[i].data.cpu().numpy().squeeze()
-                    mask = cv2.resize(mask, original_shape[::-1],
-                                      interpolation=cv2.INTER_NEAREST)
-                    detection["mask"] = mask.astype(np.float32)
-                detections.append(detection)
+        for i, box in enumerate(boxes):
+            detection = {
+                "bbox": box,
+                "confidence": float(confs[i]),
+                "class_id": int(classes[i])
+            }
+            if masks and return_masks:
+                mask = masks[i].data.cpu().numpy().squeeze()
+                # original_shape is (height, width), cv2.resize expects (width, height)
+                mask = cv2.resize(mask, original_shape[::-1], interpolation=cv2.INTER_NEAREST)
+                detection["mask"] = mask.astype(np.float32)
+            detections.append(detection)
         if not detections:
             logging.warning("No detections were found...")
         return detections
@@ -193,7 +207,14 @@ class FoodDetector:
                 self.model(images.to(self.device))
 
     def quantize(self) -> None:
-        self.model = ModelOptimizer.quantize_model(self.model)
+        """
+            Quantize the model using ModelOptimizer.
+            Note: Requires ModelOptimizer to be implemented.
+            """
+        try:
+            self.model = ModelOptimizer.quantize_model(self.model)
+        except NotImplementedError:
+            logging.warning("ModelOptimizer not implemented. Quantization skipped.")
 
     def train(self, data_yaml:str, epochs:int = 100, batch_size:int=16,
               image_size:int=640) -> None:

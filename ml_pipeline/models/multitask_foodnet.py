@@ -6,8 +6,19 @@ from torch import nn
 from model_factory import create_backbone, get_feature_dim, create_multitask_head
 
 class MultiTaskFoodNet(nn.Module):
+    """A multitask neural network for food image analysis.
+    Args:
+        num_classes (int): Number of food categories.
+        calories_scale (int): Scaling factor for calorie predictions.
+        protein_scale (int): Scaling factor for protein predictions.
+        arch (str, optional): Backbone architecture (e.g., 'resnet50'). Defaults to 'resnet50'.
+        input_size (tuple, optional): Input image size (height, width). Defaults to (224, 224).
+
+    Returns:
+        Dict[str, torch.Tensor]: Outputs for classification, nutrition (calories, protein, fat, carbs), and portion size.
+    """
     def __init__(self, num_classes:int, calories_scale:int,
-                 protein_scale:int) -> None:
+                 protein_scale:int, arch: str = "resnet50", input_size: tuple = (224, 224)) -> None:
         super().__init__()
         self.feature_extractor = create_backbone()
         in_features = get_feature_dim(self.feature_extractor)
