@@ -24,7 +24,9 @@ class FoodSystemValidator:
             # Detection
             detections = self.detector.detect(img, return_masks=True)
             self.logger.info(f"Detected {len(detections)} items")
-
+            if len(detections) == 0:
+                self.logger.warning("No food items detected in image")
+                return False, "No detections found"
             results = []
             for det in detections:
                 # Classification

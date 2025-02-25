@@ -42,8 +42,11 @@ class ModelOptimizer:
         """
         device = next(model.parameters()).device
         dummy_input = torch.randn(1, *input_shape, device=device)
+        if dynamic_axes is None:
+            dynamic_axes = {"input":{0:"batch_size"},
+                            "output":{0:"batch_size"}}
         try:
-            torch.onnx.export(model, dummy_input, onnx_path, dynamic_axes=dynamic_axes,
+            torch.onnx.export(model, (dummy_input,), onnx_path, dynamic_axes=dynamic_axes,
                               input_names=["input"], output_names=["output"])
         except Exception as e:
             logging.error(f"ONNX export failed: {e}")

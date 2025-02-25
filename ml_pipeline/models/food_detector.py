@@ -121,18 +121,21 @@ class FoodDetector:
 
     def build_trt_engine(self, output_path="yolov8.trt"):
         """Export YOLOv8 to TensorRT engine with proper optimization"""
-        ModelOptimizer.export_tensorrt(self.model, output_path=output_path)
+        #Export YOLO model ONNX first
+        onnx_path = "yolov8.onnx"
+        self.model.export(format="onnx", dynamic=True)
+        ModelOptimizer.export_tensorrt(onnx_path, output_path=output_path)
 
     def _preprocess(self, image:Union[str, np.ndarray]) -> np.ndarray:
         """Preprocess image for TensorRT inference"""
         # Resize and Normalize
-        img = cv2.resize(image, self.input_shape[1:][::-1])
-        img = img.transpose(2,0,1) # HWC to CHW
-        img = np.ascontiguousarray(img).astype(np.float32)/255.0
-        # Expand dimension if needed
-        if len(img.shape)==3:
-            img = np.expand_dims(img, axis=0)
-        return img
+        h, w = image.shape[:2]
+        scale = min(self.input_shape[1]/w, self.input_shape[2]/h)
+        new_size = (int(w * scale), int(h * scale))
+        img = cv2.resize(image, new_size)
+        img = np.pad(img, ((0, self.input_shape[1]-new_size[1]),
+                           (0, self.input_shape[2] - new_size[0]), (0,0)))
+        return img.transpose(2,0,1).astype(np.float32)/255.0
 
     def detect(self, image:Union[str, np.ndarray],
                return_masks:bool=False) -> List[Dict[str, Union[List, float, int]]]:
@@ -153,7 +156,9 @@ class FoodDetector:
             # Run inference
             results = self.model(image, conf = self.conf_threshold,
                                 verbose=False, device=self.device)
-            return self._process_results(results, return_masks, image.shape[:2])
+            single_result = results[0]
+            return self._process_results(single_result, return_masks, image.shape[:2])
+
     def _infer_trt(self, image:Union[str, np.ndarray], return_masks:bool) -> List[Dict[str, Union[np.ndarray, float, int]]]:
         # Placeholder for TensorRT inference
         preprocessed = self._preprocess(image)
@@ -165,21 +170,23 @@ class FoodDetector:
         for output in self.outputs:
             cuda.memcpy_dtoh_async(output["host"], output["device"], self.stream)
         self.stream.synchronize()
-        return []
+        return self._process_results(self.outputs[0]["host"],
+                                     return_masks, image.shape[:2])
     @staticmethod
-    def _process_results(results, return_masks:bool,
+    def _process_results(result, return_masks:bool,
                          original_shape:Tuple) -> List[Dict[str, Union[np.ndarray, float, int]]]:
         # Process results
         detections = []
         # YOLOv8 returns a single Results object for one image
-        boxes = results.boxes.xyxy.cpu().numpy()
-        confs = results.boxes.conf.cpu().numpy()
-        classes = results.boxes.cls.cpu().numpy()
-        masks = results.masks if return_masks and hasattr(results, "masks") else None
+        boxes = result.boxes.xyxy.cpu().numpy()
+        confs = result.boxes.conf.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy()
+        masks = result.masks if return_masks and hasattr(result, "masks") else None
 
-        for i, box in enumerate(boxes):
+        for i in range(boxes.shape[0]):
+            box = boxes[i]
             detection = {
-                "bbox": box,
+                "bbox": tuple(box),
                 "confidence": float(confs[i]),
                 "class_id": int(classes[i])
             }

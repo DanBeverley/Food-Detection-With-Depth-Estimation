@@ -85,8 +85,10 @@ class FoodTrainingSystem:
         # Create train/val split
         train_size = int(self.config_params["training"]["train_val_split"] * len(self.dataset))
         val_size = len(self.dataset) - train_size
+        torch.manual_seed(42)
+        generator = torch.Generator().manual_seed(42)
         self.train_dataset, self.val_dataset = torch.utils.data.random_split(
-            self.dataset, [train_size, val_size]
+            self.dataset, [train_size, val_size], generator=generator
         )
 
         # Initialize dataloaders
@@ -108,7 +110,7 @@ class FoodTrainingSystem:
 
         # Models
         self.detector = FoodDetector(
-            quantized=self.config_params["training"]["quantize"],
+            quantized=False,
             device=self.device
         )
         self.classifier= FoodClassifier(
