@@ -25,6 +25,6 @@ def get_gan_transforms():
         A.Rotate(limit=30),
         A.RandomBrightnessContrast(p=0.2),
         A.GridDistortion(p=0.3),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ], additional_targets={'mask': 'mask'})
