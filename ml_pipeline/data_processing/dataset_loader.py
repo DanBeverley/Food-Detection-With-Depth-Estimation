@@ -33,6 +33,9 @@ class UECFoodDataset(Dataset):
         self.transform = transform or get_train_transforms()
         self.image_ext = image_ext
         self.nutrition_mapper = nutrition_mapper
+        if self.nutrition_mapper:
+            self._load_nutrition_data()
+        self._validate_nutrition_data()
         self.shape_mapper = UEC256ShapeMapper()
         self.data = []            # Each dict corresponds to one image
         self.id_to_category = {}  # Mapping numerical id to category name
@@ -45,29 +48,23 @@ class UECFoodDataset(Dataset):
                                 "label":0,
                                 "nutrition":NutritionMapper.get_default_nutrition(),
                                 "portions":0.0}
-    async def initialize(self) -> None:
-        """Async initialization hook"""
-        if self.nutrition_mapper:
-            await self._load_nutrition_data()
-            self._validate_nutrition_data()
-
-    async def _load_nutrition_data(self) -> None:
+    def _load_nutrition_data(self) -> None:
         """Async nutrition data loading with parallel requests"""
         if not self.nutrition_mapper:
             return
-        # Create tasks for all categories
-        async with aiohttp.ClientSession() as session:
-            self.nutrition_mapper.session = session
-            tasks = [self.nutrition_mapper.map_food_label_to_nutrition(cat_name)
-                     for cat_name in self.id_to_category.values()]
-            results = await asyncio.gather(*tasks, return_exceptions = True)
+        session = aiohttp.ClientSession()
+        self.nutrition_mapper.session = session
+        tasks = [self.nutrition_mapper.map_food_label_to_nutrition(cat)
+                 for cat in self.id_to_category.values()]
+        loop = asyncio.get_event_loop()
+        results = loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
         # Process results
-        for cat_name, result in zip(self.id_to_category.values(), results):
+        for cat, result in zip(self.id_to_category.values(), results):
             if isinstance(result, Exception):
-                logging.warning(f"Nutrition load failed for {cat_name}:{result}")
-                self.nutrition_cache[cat_name] = self.nutrition_mapper.get_default_nutrition()
+                logging.warning(...)
+                self.nutrition_cache[cat] = self.nutrition_mapper.get_default_nutrition()
             else:
-                self.nutrition_cache[cat_name] = result
+                self.nutrition_cache[cat] = result
 
     def _validate_nutrition_data(self) -> None:
         """Validate cached nutrition data"""

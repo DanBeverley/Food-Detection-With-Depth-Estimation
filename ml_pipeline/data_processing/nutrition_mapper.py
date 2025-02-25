@@ -99,11 +99,11 @@ class NutritionMapper:
             if nutrient_id == NUTRITION_IDS["calories"]:
                 nutritions["calories"] = float(amount)
             elif nutrient_id == NUTRITION_IDS["protein"]:
-                nutrient["protein"] = float(amount)
+                nutritions["protein"] = float(amount)
             elif nutrient_id == NUTRITION_IDS["fat"]:
-                nutrition["fat"] = float(amount)
+                nutritions["fat"] = float(amount)
             elif nutrient_id == NUTRITION_IDS["carbohydrates"]:
-                nutrition["carbohydrates"] = float(amount)
+                nutritions["carbohydrates"] = float(amount)
         if sum(nutritions.values())==0:
             logging.warning(f"No nutrition data found for food item: {food_item.get('description')}")
             return NutritionMapper.get_default_nutrition()

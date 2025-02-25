@@ -1,14 +1,12 @@
 import logging
-import os
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
 from scipy.spatial import ConvexHull
-from functools import lru_cache
 from shape_mapping import ShapePrior
-
+from ml_pipeline.data_processing.shape_mapping import UEC256ShapeMapper
 
 class HybridPortionEstimator:
     def __init__(self, device=None, nutrition_mapper=None):
@@ -166,10 +164,10 @@ class HybridPortionEstimator:
         }
         physical_size = reference_sizes.get(best_ref["label"], known_width_cm)
         return physical_size/ref_width
-    @lru_cache(maxsize=128)
     def _get_depth_map(self, image:np.ndarray) -> np.ndarray:
         """Get depth map using MiDaS"""
-        img_tensor = self.midas_transform(image).to(self.device)
+        img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img_tensor = self.midas_transform(img).to(self.device)
         with torch.no_grad():
             depth = self.midas(img_tensor).squeeze().cpu().numpy()
         return depth
@@ -201,7 +199,9 @@ class HybridPortionEstimator:
 
 class UECVolumeEstimator:
     def __init__(self, food_shape_priors = None):
-        self.food_shape_priors = food_shape_priors or self._get_default_shape_prior()
+        self.shape_mapper = UEC256ShapeMapper()
+        self.food_shape_priors = self.shape_mapper.category_map
+        # self.food_shape_priors = food_shape_priors or self._get_default_shape_prior()
     @staticmethod
     def _get_default_shape_prior():
         """Define shape priors for common UEC-256 food categories
@@ -245,17 +245,17 @@ class UECVolumeEstimator:
             confidence: Confidence score of the estimation
         """
         # Shape priors
-        shape_prior = self.food_shape_priors.get(food_class, self.food_shape_priors["default"])
-
+        # shape_prior = self.food_shape_priors.get(food_class, self.food_shape_priors["default"])
+        shape_prior = self.shape_mapper.get_shape_prior(food_class)
         # Calculate base metrics
         area_pixels = np.sum(mask)
         area_cm2 = area_pixels*(reference_scale**2)
 
-        if shape_prior['shape'] == 'dome':
+        if shape_prior.shape== 'dome':
             volume = self._estimate_dome_volume(depth_map, mask, area_cm2, shape_prior)
-        elif shape_prior['shape'] == 'bowl_content':
+        elif shape_prior.shape == 'bowl_content':
             volume = self._estimate_bowl_content_volume(depth_map, mask, area_cm2, shape_prior)
-        elif shape_prior['shape'] == 'cylinder':
+        elif shape_prior.shape == 'cylinder':
             volume = self._estimate_cylinder_volume(depth_map, mask, area_cm2, shape_prior)
         else:  # irregular shape
             volume = self._estimate_irregular_volume(depth_map, mask, area_cm2, shape_prior, reference_scale)
@@ -274,19 +274,21 @@ class UECVolumeEstimator:
         radius = np.sqrt(area_cm2/np.pi)
         height = np.max(masked_depth[mask>0])
         volume = (1/3)*np.pi*height*(3*radius**2+height**2)
-        return volume*prior.get("volume_modifier", 1.0)
+        return volume*prior.volume_modifier
     @staticmethod
     def _estimate_bowl_content_volume(depth_map, mask, area_cm2, prior):
         """Estimate volume for food served in bowls"""
         masked_depth = depth_map*mask
-        mean_depth = np.mean(masked_depth[mask>0])
-
+        mean_depth = np.mean(masked_depth[mask>0]) if np.sum(mask)>0 else 0.0
+        # Default fallback if missing
+        liquid_ratio = prior.liquid_ratio or 0.5
+        solid_ratio = prior.solid_ratio or 0.5
         # Calculate bowl volume and apply content ratio
         bowl_volume = area_cm2*mean_depth
-        liquid_volume = bowl_volume*prior["liquid_ratio"]
-        solid_volume = bowl_volume*prior["solid_ratio"]
+        liquid_volume = bowl_volume*liquid_ratio
+        solid_volume = bowl_volume*solid_ratio
 
-        return (liquid_volume + solid_volume)*prior.get("volume_modifier", 1.0)
+        return (liquid_volume + solid_volume)*prior.volume_modifier
 
     def _estimate_cylinder_volume(self, depth_map, mask, area_cm2, prior):
         """Estimate volume for cylindrical foods e.g. sushi roll"""
@@ -296,9 +298,9 @@ class UECVolumeEstimator:
         # Calculate radius from area and length
         radius = area_cm2/(2*length)
         # Use height from prior
-        height = 2*radius*prior["height_ratio"]
+        height = 2*radius*prior.height_ratio
         volume = np.pi * (radius**2) * height
-        return volume * prior.get("volume_modifier", 1.0)
+        return volume * prior.volume_modifier
     @staticmethod
     def _estimate_irregular_volume(depth_map:np.ndarray, mask:np.ndarray,
                                    area_cm2: float, prior:ShapePrior,
@@ -326,7 +328,7 @@ class UECVolumeEstimator:
         avg_depth_cm = np.sum(scaled_depth) / pixel_area if pixel_area > 0 else 0
         volume_cm3 = area_cm2 * avg_depth_cm
         # Apply shape-specific modifier from prior
-        return volume_cm3 * prior.get("volume_modifier", 1.0)
+        return volume_cm3 * prior.volume_modifier
     @staticmethod
     def _get_contours(mask):
         """Extract contours from binary mask"""
@@ -350,7 +352,7 @@ class UECVolumeEstimator:
         depth_quality = self._assess_depth_quality(depth_map, mask)
 
         # 3. Shape prior reliability
-        shape_confidence = 0.9 if prior['shape'] != 'irregular' else 0.7
+        shape_confidence = 0.9 if prior.shape != 'irregular' else 0.7
 
         return mask_quality * 0.4 + depth_quality * 0.4 + shape_confidence * 0.2
 

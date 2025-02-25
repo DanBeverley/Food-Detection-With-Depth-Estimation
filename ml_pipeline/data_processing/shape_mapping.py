@@ -21,6 +21,8 @@ class ShapePrior:
     typical_serving_cm3:Optional[float]= None # Reference volume
     sub_components:Optional[List[str]] = None # For composite dishes
     special_handling:Optional[str] = None # special processing instructions
+    liquid_ratio:Optional[float] = None # Added for bowl_content
+    solid_ratio:Optional[float] = None # Added for bowl_content
 
 class UEC256ShapeMapper:
     def __init__(self):
@@ -38,9 +40,9 @@ class UEC256ShapeMapper:
             # Rice dishes
             "rice": ShapePrior(
                 shape=FoodShape.DOME,
-                height_ratio=0.5,
-                volume_modifier=0.9,
-                typical_serving_cm3=200
+                height_ratio=0.6,
+                volume_modifier=1.0,
+                typical_serving_cm3=180
             ),
             "fried_rice": ShapePrior(
                 shape=FoodShape.DOME,
@@ -56,18 +58,22 @@ class UEC256ShapeMapper:
             ),
             "donburi": ShapePrior(
                 shape=FoodShape.BOWL_CONTENT,
-                height_ratio=0.7,
-                volume_modifier=0.9,
-                typical_serving_cm3=400,
+                height_ratio=0.8,
+                volume_modifier=1.0,
+                typical_serving_cm3=380,
+                liquid_ratio=0.15,
+                solid_ratio=0.85,
                 sub_components=["rice", "toppings", "sauce"]
             ),
 
             # Noodle dishes
             "ramen": ShapePrior(
                 shape=FoodShape.BOWL_CONTENT,
-                height_ratio=0.8,
+                height_ratio=0.6,
                 volume_modifier=0.95,
-                typical_serving_cm3=500,
+                typical_serving_cm3=550,
+                liquid_ratio=0.7,
+                solid_ratio=0.3,
                 sub_components=["broth", "noodles", "toppings"]
             ),
             "udon": ShapePrior(
@@ -93,8 +99,8 @@ class UEC256ShapeMapper:
             "sushi_roll": ShapePrior(
                 shape=FoodShape.CYLINDER,
                 height_ratio=1.0,
-                volume_modifier=0.9,
-                typical_serving_cm3=30
+                volume_modifier=0.85,
+                typical_serving_cm3=35
             ),
             "nigiri_sushi": ShapePrior(
                 shape=FoodShape.IRREGULAR,
@@ -157,9 +163,11 @@ class UEC256ShapeMapper:
             ),
             "curry": ShapePrior(
                 shape=FoodShape.BOWL_CONTENT,
-                height_ratio=0.7,
-                volume_modifier=0.95,
-                typical_serving_cm3=300
+                height_ratio=0.6,
+                volume_modifier=0.92,
+                typical_serving_cm3=350,
+                liquid_ratio=0.7,
+                solid_ratio=0.3
             ),
             "oden": ShapePrior(
                 shape=FoodShape.BOWL_CONTENT,
@@ -335,6 +343,13 @@ class UEC256ShapeMapper:
                 volume_modifier=0.95,
                 typical_serving_cm3=250,
                 sub_components=["tofu", "sauce", "meat"]
+            ),
+            "okonomiyaki": ShapePrior(
+                shape=FoodShape.IRREGULAR,
+                height_ratio=0.5,
+                volume_modifier=1.0,
+                typical_serving_cm3=220,
+                sub_components=["batter", "cabbage", "meat", "negi"]
             ),
             # Default for unknown categories
             "default": ShapePrior(

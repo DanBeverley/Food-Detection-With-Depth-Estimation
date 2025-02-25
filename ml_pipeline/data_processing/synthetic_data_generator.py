@@ -182,7 +182,10 @@ class GANTrainer:
             sample_filename: Name of the generated sample file
             generation_params: Dictionary of generation parameters (optional)
         """
-        food_categories = ["rice", "sushi", "ramen", "tempura"]
+        if self.nutrition_mapper:
+            food_categories = list(self.nutrition_mapper.density_db.keys())
+        else:
+            food_categories = ["default_food"]
         fake_label = np.random.choice(food_categories)
         if self.nutrition_mapper:
             nutrition = self.nutrition_mapper.map_food_label_to_nutrition(fake_label)
