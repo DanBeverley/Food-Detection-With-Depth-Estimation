@@ -30,8 +30,11 @@ class UECFoodDataset(Dataset):
             image_ext (str): Extension of the image files (default '.jpg').
         """
         self.root_dir = Path(root_dir)
+        if self.root_dir is None:
+            raise TypeError("The root directory is empty...")
         self.transform = transform or get_train_transforms()
         self.image_ext = image_ext
+        self.nutrition_cache: Dict[str, Dict[str, float]] = {}  # {category_name: nutrition_data}
         self.nutrition_mapper = nutrition_mapper
         if self.nutrition_mapper:
             self._load_nutrition_data()
@@ -41,8 +44,6 @@ class UECFoodDataset(Dataset):
         self.id_to_category = {}  # Mapping numerical id to category name
         self._read_category_file()
         self._load_dataset()
-        self._validate_nutrition_data()
-        self.nutrition_cache: Dict[str, Dict[str, float]] = {}  # {category_name: nutrition_data}
         self.fallback_sample = {"image_path":"placeholder.jpg",
                                 "bboxes":[[0,0,100,100]],
                                 "label":0,
@@ -72,7 +73,7 @@ class UECFoodDataset(Dataset):
             return
         for cat_id, food_name in self.id_to_category.items():
             try:
-                nutrition = self.nutrition_mapper.get_nutrition_data(food_name)
+                nutrition = self.nutrition_cache.get(food_name)
                 if not nutrition:
                     logging.warning(f"Missing nutrition data for {food_name}")
                     continue
@@ -116,9 +117,13 @@ class UECFoodDataset(Dataset):
                 self.id_to_category[cat_id] = cat_name
         else:
             logging.warning(f"⚠️ Warning: category.txt not found in the root directory.")
-            self.id_to_category = None
+            self.id_to_category = {}
 
     def _load_dataset(self) -> None:
+        total_images = 0
+        possible_exts = [self.image_ext, self.image_ext.lower(),
+                         self.image_ext.upper()]
+        possible_exts = list(dict.fromkeys(possible_exts))
         for category in sorted(os.listdir(self.root_dir)):
             category_path = os.path.join(self.root_dir, category)
             if not os.path.isdir(category_path):
@@ -153,15 +158,19 @@ class UECFoodDataset(Dataset):
             # Create an entry for each image
             for img_id, bboxes in image_to_bboxes.items():
                 # Construct image path
-                image_path = os.path.join(category_path, img_id + self.image_ext)
-                if not os.path.exists(image_path):
-                    image_path = os.path.join(category_path, img_id + self.image_ext.lower())
-                if not os.path.exists(image_path):
-                    print(f"⚠️ Warning: Image {image_path} not found. Skipping...")
+                image_path = None
+                for ext in possible_exts:
+                    candidate = os.path.join(category_path, f"{img_id}{ext}")
+                    if os.path.exists(candidate):
+                        image_path = candidate
+                        break
+                if image_path is None:
+                    logging.warning(f"Warning: Image {img_id} not found with extensions {possible_exts}. Skipping...")
                     continue
                 self.data.append({"image_path":image_path,
-                                  "bboxes":bboxes,
-                                  "label":label})
+                                  "bboxes":bboxes, "label":label})
+                total_images += 1
+        logging.info(f"Total images loaded: {total_images}")
 
     def __len__(self) -> int:
         return len(self.data)
@@ -201,14 +210,10 @@ class UECFoodDataset(Dataset):
             else:
                 mask = item.get("mask")
             # Convert to YOLO format (normalized x,y,w,h)
+            valid_bboxes = []
+            valid_labels = []
+            valid_portions = []
             height, width = image.shape[1], image.shape[2] # Transformed image shape (C,H,W)
-            yolo_boxes = []
-            for (x1, y1, x2, y2) in bboxes:
-                x_center = ((x1+x2)/2)/width
-                y_center = ((y1+y2)/2)/height
-                w = (x2-x1)/width
-                h = (y2-y1)/height
-                yolo_boxes.append([x_center, y_center, w, h])
             # Nutrition data
             food_name = self.id_to_category.get(item["label"], "unknown")
             nutrition = self.nutrition_cache.get(food_name,
@@ -220,23 +225,42 @@ class UECFoodDataset(Dataset):
                                           dtype=torch.float32)
             # Portion calculation after transformation
             portions = []
-            if mask is not None:
-                for x1, y1, x2, y2 in bboxes:
+            for i,(x1, y1, x2, y2) in enumerate(bboxes):
+                if x1 >= x2 or y1 >= y2:
+                    logging.warning(f"Invalid bounding box ({x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f}) for sample {idx}. Skipping...")
+                    continue
+                valid_bboxes.append([x1, y1, x2, y2])
+                valid_labels.append(labels[i])
+                if mask is not None:
                     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                     mask_crop = mask[y1:y2, x1:x2]
                     mask_area = np.sum(mask_crop)
                     portion = self._estimate_portion(food_name, mask_area)
-                    portions.append(portion)
-            else:
-                for x1, y1, x2, y2 in bboxes:
+                else:
                     bbox_area = (x2-x1)*(y2-y1)
                     portion = self._estimate_portion(food_name, bbox_area)
-                    portions.append(portion)
+                    valid_portions.append(portion)
+            height, width = None, None
+            if isinstance(image, torch.Tensor):
+                height, width = image.shape[1], image.shape[2]
+            else:
+                height, width = image.shape[0], image.shape[1]
+
+            yolo_boxes = []
+            for (x1, y1, x2, y2) in bboxes:
+                x_center = ((x1 + x2) / 2) / width
+                y_center = ((y1 + y2) / 2) / height
+                w = (x2 - x1) / width
+                h = (y2 - y1) / height
+                yolo_boxes.append([x_center, y_center, w, h])
+
             target = {"bboxes":torch.tensor(yolo_boxes, dtype=torch.float32),
-                      "labels":torch.tensor(labels, dtype=torch.int64),
-                      "portions":torch.tensor(portions, dtype=torch.float32),
+                      "labels":torch.tensor(valid_labels, dtype=torch.int64),
+                      "portions":torch.tensor(valid_portions, dtype=torch.float32),
                       "nutritions":nutrition_data}
+
             return image, target
+
         except Exception as e:
             logging.error(f"Failed to load sample {idx}: {str(e)}")
             return self._get_fallback_sample()
@@ -259,10 +283,10 @@ def collate_fn(batch:Iterable[Tuple[torch.Tensor,
         image.append(img)
         # Combine labels and boxes into [class_id, x, y, w, h]
         yolotarget = torch.cat([target["labels"].unsqueeze(1),      # [num_boxes, 1]
-                                target["boxes"],                            # [num_boxes, 4]
+                                target["bboxes"],                            # [num_boxes, 4]
                                 target["portions"].unsqueeze(1)], dim = 1)  # [num_boxes, 1]
         detection_targets.append(yolotarget)
-        nutrition_targets.append(target["nutrition"])
+        nutrition_targets.append(target["nutritions"])
     image = torch.stack(image, dim = 0)
     return (image, {"detection":detection_targets,
                      "nutrition":torch.stack(nutrition_targets,0)})
