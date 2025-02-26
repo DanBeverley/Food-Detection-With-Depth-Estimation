@@ -40,7 +40,11 @@ class FoodGANDataset(Dataset):
         return len(self.image_paths)
     def __getitem__(self, idx):
         img = cv2.imread(str(self.image_paths[idx]))
+        if img is None:
+            raise FileNotFoundError(f"Image not found: {self.image_paths[idx]}")
         mask = cv2.imread(str(self.mask_paths[self.image_paths[idx].stem]), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise FileNotFoundError(f"Mask not found for {self.image_paths[idx]}")
         return self.transform(image=np.array(img), mask = np.array(mask))
 
 class Generator(nn.Module):
@@ -125,8 +129,8 @@ class GANTrainer:
         self.device = device if torch.cuda.is_available() else torch.device("cpu")
         self.nz = nz
         self.nutrition_mapper = nutrition_mapper
-        self.netG = Generator(nz = nz).to(device=device)
-        self.netD = Discriminator().to(device=device)
+        self.netG = Generator(nz = nz).to(device=self.device)
+        self.netD = Discriminator().to(device=self.device)
 
         self.optimG = optim.Adam(self.netG.parameters(), lr=lr, betas=(beta1, 0.999))
         self.optimD = optim.Adam(self.netD.parameters(), lr=lr, betas=(beta1, 0.999))

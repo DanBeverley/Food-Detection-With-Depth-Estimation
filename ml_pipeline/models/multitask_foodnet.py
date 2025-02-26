@@ -1,5 +1,5 @@
 import logging
-from typing import Dict
+from typing import Dict, Tuple
 
 import torch
 from torch import nn
@@ -18,10 +18,10 @@ class MultiTaskFoodNet(nn.Module):
         Dict[str, torch.Tensor]: Outputs for classification, nutrition (calories, protein, fat, carbs), and portion size.
     """
     def __init__(self, num_classes:int, calories_scale:int,
-                 protein_scale:int, arch: str = "resnet50", input_size: tuple = (224, 224)) -> None:
+                 protein_scale:int, arch: str = "resnet50", input_size: Tuple[int, int, int]=(3, 224, 224)) -> None:
         super().__init__()
-        self.feature_extractor = create_backbone()
-        in_features = get_feature_dim(self.feature_extractor)
+        self.feature_extractor = create_backbone(arch=arch)
+        in_features = get_feature_dim(self.feature_extractor, input_size=input_size)
         self.shared_fc = nn.Sequential(
             nn.Linear(in_features, 1024),
             nn.BatchNorm1d(1024),
@@ -36,7 +36,7 @@ class MultiTaskFoodNet(nn.Module):
         self.portion_head = nn.Sequential(nn.Linear(1024, 256),
                                           nn.ReLU(),
                                           nn.Linear(256, 1),
-                                          nn.Sigmoid())
+                                          nn.ReLU())
         self.nutrition_head = create_multitask_head(1024)
 
         # Initialize scaling factors as registered buffers instead of parameters
@@ -58,8 +58,8 @@ class MultiTaskFoodNet(nn.Module):
             nutrition = torch.stack([
                 nutrition[:, 0] * self.calories_scale,
                 nutrition[:, 1] * self.protein_scale,
-                torch.clamp(nutrition[:, 2], 0, 100), # Fat percentage,
-                torch.clamp(nutrition[:, 3],0 , 100) # Carbs Percentage
+                nutrition[:, 2]*100, # Fat percentage,
+                nutrition[:, 3]*100 # Carbs Percentage
             ], dim = 1)
             return {"class":self.class_head(shared),
                     "nutrition":nutrition,

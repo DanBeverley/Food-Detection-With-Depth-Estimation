@@ -8,6 +8,12 @@ import aiohttp
 from redis import Redis, ConnectionError as RedisConnectionError
 from typing import Optional, Dict, Any, cast
 
+from tenacity import retry
+from tenacity import AsyncRetrying, wait_exponential, stop_after_attempt, retry_if_exception_type
+from aiohttp import ClientResponseError, ClientConnectionError
+
+class TooManyRequestsError(Exception):
+    pass
 
 class NutritionMapper:
     def __init__(self, api_key:str,redis_url: str = "redis://localhost:6379",
@@ -37,14 +43,23 @@ class NutritionMapper:
         self.session = aiohttp.ClientSession()
 
     def _verify_redis_connection(self) -> None:
-        try:
+        if self.redis is None:
+            logging.warning("Redis connection is not initialized. Using in memory-cache")
+            return
+        @retry(wait = wait_exponential(multiplier=0.1, min=0.1, max=1),
+               stop = stop_after_attempt(3), retry = retry_if_exception_type(RedisConnectionError),
+               reraise = True)
+        def ping_redis():
             self.redis.ping()
+        try:
+            ping_redis()
         except RedisConnectionError:
-            logging.warning("Warning: Redis connection failed. Using in-memory cache")
-            self.redis=None
+            logging.warning("⚠️ Redis connection failed after retries. Using in-memory cache.")
+            self.redis = None
         except Exception as e:
             logging.error(f"Unexpected Redis error: {e}")
-            self.redis=None
+            self.redis = None
+
     async def close(self) -> None:
         await self.session.close()
     async def __aenter__(self) -> "NutritionMapper":
@@ -61,7 +76,7 @@ class NutritionMapper:
                 if cached:
                     return json.loads(cached)
             except RedisConnectionError:
-                pass
+                logging.warning("Redis cache retrieval failed due to connection issue")
         # Try local cache
         if query.lower() in self.cache:
             return self.cache[query.lower()]
@@ -71,14 +86,32 @@ class NutritionMapper:
             "query": query,
             "pageSize": max_results
         }
-        async with self.session.get(self.base_url, params=params) as response:
-              if response.status == 200:
-                data = await response.json()
-                if "foods" in data and len(data["foods"])>0:
-                    nutritions = self._parse_nutrition_data(data["foods"][0])
-                    self._cache_data(query, nutritions)
-                    return nutritions
-              return None
+        retry_config = {"wait":wait_exponential(multiplier=0.2, max=5),
+                        "stop":stop_after_attempt(3),
+                        "retry":(retry_if_exception_type(ClientConnectionError) |
+                                 retry_if_exception_type(ClientResponseError) |
+                                 retry_if_exception_type(TooManyRequestsError))}
+
+        async for attempt in AsyncRetrying(**retry_config):
+            with attempt:
+                async with self.session.get(self.base_url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if "foods" in data and len(data["foods"])>0:
+                            nutritions = self._parse_nutrition_data(data["foods"][0])
+                            self._cache_data(query, nutritions)
+                            return nutritions
+                        else:
+                            logging.warning(f"No nutrition data found for query: {query}")
+                            return None
+                    elif response.status == 429:
+                        retry_after = response.headers.get("Retry-After", 1)
+                        logging.warning(f"HTTP 429: Too Many Requests. Retry-After: {retry_after} sec")
+                        raise TooManyRequestsError("Too many requests")
+                    else:
+                        response.raise_for_status()
+        logging.error(f"Failed to retrieve nutrition data for {query} after retries")
+        return None
 
     @staticmethod
     def _parse_nutrition_data(food_item: Dict[str, Any]) -> Dict[str, float]:

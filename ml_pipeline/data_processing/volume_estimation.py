@@ -27,7 +27,7 @@ class HybridPortionEstimator:
         """Load both reference object detector and depth estimation model"""
         try:
             yolov8_path = Path("models/yolov8n.pt")
-            if yolov8_path.exists():
+            if yolov8_path.exists() and yolov8_path.is_file():
                 self.ref_detector = torch.hub.load('ultralytics/yolov8', 'custom', path=str(yolov8_path))
             else:
                 self.ref_detector = torch.hub.load("ultralytics/yolov8", 'yolov8n', pretrained=True)
@@ -115,11 +115,15 @@ class HybridPortionEstimator:
         results = self.ref_detector(image)
         reference_classes = ["plate", "credit card", "bowl"]
         ref_objects = []
-        if hasattr(results, "pred") and results.pred is not None and len(results.pred)>0:
-            for *box, conf, cls in results.pred[0]:
-                label = self.ref_detector.names[int(cls)]
-                if label in reference_classes:
-                    ref_objects.append({'box':box,'label':label,'confidence':conf})
+        for box in results.boxes:
+            cls = int(box.cls)
+            label = self.ref_detector.names[cls]
+            if label in reference_classes:
+                ref_objects.append({
+                    'box': box.xyxy[0].tolist(),
+                    'label': label,
+                    'confidence': float(box.conf)
+                })
         return ref_objects
 
     @staticmethod
@@ -129,7 +133,7 @@ class HybridPortionEstimator:
             return 22/640 # Fallback default
 
         # Select most confident reference object
-        best_ref = max(ref_objects, key=lambda x:x["confidence"])
+        best_ref = max(ref_objects, key=lambda x:x["confidence"]*(x["box"][2] - x["box"][0]))
         ref_width = best_ref["box"][2] - best_ref["box"][0]
 
         # Known physical dimensions for common references
@@ -177,7 +181,7 @@ class HybridPortionEstimator:
         """Calculate overall confidence score for volume estimation"""
         weights = {"depth":0.4, "mask":0.4, "reference":0.2}
         confidence = (depth_quality * weights["depth"] +
-                      depth_quality * weights["mask"] +
+                      mask_quality * weights["mask"] +
                       reference_confidence * weights["reference"])
         return min(max(confidence, 0.0), 1.0)
 
@@ -269,17 +273,15 @@ class UECVolumeEstimator:
         Estimate volume for dome-shaped foods (e.g., rice portions)
         """
         masked_depth = depth_map*mask
-        max_height = np.max(masked_depth(mask>0))
-        # Spherical cap formula with modification
-        radius = np.sqrt(area_cm2/np.pi)
-        height = np.max(masked_depth[mask>0])
-        volume = (1/3)*np.pi*height*(3*radius**2+height**2)
+        height = np.max(masked_depth[mask > 0]) if np.any(mask) else 0.1
+        radius = np.sqrt(area_cm2 / np.pi)
+        volume = (1 / 3) * np.pi * height * (3 * radius ** 2 + height ** 2)
         return volume*prior.volume_modifier
     @staticmethod
     def _estimate_bowl_content_volume(depth_map, mask, area_cm2, prior):
         """Estimate volume for food served in bowls"""
         masked_depth = depth_map*mask
-        mean_depth = np.mean(masked_depth[mask>0]) if np.sum(mask)>0 else 0.0
+        mean_depth = np.mean(masked_depth[mask>0]) if np.sum(mask)>0 else 0.1
         # Default fallback if missing
         liquid_ratio = prior.liquid_ratio or 0.5
         solid_ratio = prior.solid_ratio or 0.5
@@ -454,12 +456,15 @@ class UnifiedFoodEstimator:
                     image=image,
                     food_boxes=[food['bbox']],
                     food_labels=[food_class],
-                    masks=[food["mask"]] if "mask" in food else None)[0]['volume']
+                    masks=[food["mask"]] if "mask" in food else None)[0]
                 volume = portion["volume"]
                 confidence = 1.0
             # Add nutrition data from hybrid system
-            nutrition = self.hybrid_estimator.nutrition_mapper.map_food_label_to_nutrition(food_class)
-            calories_per_cm3 = nutrition.get("calories_per_cm3", 0) if nutrition else 0
+            nutrition = self.hybrid_estimator.nutrition_mapper.map_food_label_to_nutrition(
+                food_class) if self.hybrid_estimator.nutrition_mapper else {}
+            calories_per_100g = nutrition.get("calories_per_100g", 150)  # Default 150 cal/100g
+            density = self.hybrid_estimator._get_food_density(food_class)
+            calories = (volume * density / 100) * calories_per_100g
             results.append({
                 'volume': volume,
                 'calories': volume * nutrition['calories_per_cm3'],

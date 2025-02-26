@@ -1,4 +1,5 @@
 import logging
+import re
 from enum import Enum
 from dataclasses import dataclass
 from typing import Dict, Optional, List
@@ -23,10 +24,20 @@ class ShapePrior:
     special_handling:Optional[str] = None # special processing instructions
     liquid_ratio:Optional[float] = None # Added for bowl_content
     solid_ratio:Optional[float] = None # Added for bowl_content
+    def __post_init__(self):
+        if self.shape != FoodShape.BOWL_CONTENT and (self.liquid_ratio is not None or self.solid_ratio is not None):
+            raise ValueError("liquid_ratio and solid_ratio are only valid for BOWL_CONTENT shapes")
+        if self.liquid_ratio is not None and self.solid_ratio is not None:
+            if not(0<=self.liquid_ratio<=1 and 0<=self.solid_ratio<=1):
+                raise ValueError("liquid_ratio and solid_ratio must be between 0 and 1")
+            if abs(self.liquid_ratio + self.solid_ratio - 1.0)>1e-6:
+                raise ValueError("liquid_ratio and solid_ratio must sum to 1.0")
 
 class UEC256ShapeMapper:
     def __init__(self):
         self.category_map = self._initialize_category_map()
+        if not isinstance(self.category_map, dict):
+            raise ValueError("Category map must be a dictionary")
         if "default" not in self.category_map:
             logging.warning("Default shape prior is missing in category_map")
             self.category_map["default"] = ShapePrior(shape=FoodShape.IRREGULAR,
@@ -80,13 +91,19 @@ class UEC256ShapeMapper:
                 shape=FoodShape.BOWL_CONTENT,
                 height_ratio=0.8,
                 volume_modifier=0.95,
-                typical_serving_cm3=450
+                typical_serving_cm3=450,
+                liquid_ratio=0.6,
+                solid_ratio=0.4,
+                sub_components=["broth", "noodles", "toppings"]
             ),
             "soba": ShapePrior(
                 shape=FoodShape.BOWL_CONTENT,
                 height_ratio=0.7,
                 volume_modifier=0.95,
-                typical_serving_cm3=400
+                typical_serving_cm3=400,
+                liquid_ratio=0.6,
+                solid_ratio=0.4,
+                sub_components=["broth", "noodles", "toppings"]
             ),
             "yakisoba": ShapePrior(
                 shape=FoodShape.DOME,
@@ -119,6 +136,8 @@ class UEC256ShapeMapper:
                 height_ratio=0.6,
                 volume_modifier=0.9,
                 typical_serving_cm3=350,
+                liquid_ratio=0.05,
+                solid_ratio=0.95,
                 sub_components=["rice", "fish", "vegetables"]
             ),
 
@@ -159,7 +178,9 @@ class UEC256ShapeMapper:
                 shape=FoodShape.BOWL_CONTENT,
                 height_ratio=0.9,
                 volume_modifier=1.0,
-                typical_serving_cm3=200
+                typical_serving_cm3=200,
+                liquid_ratio=0.8,
+                solid_ratio=0.2
             ),
             "curry": ShapePrior(
                 shape=FoodShape.BOWL_CONTENT,
@@ -174,6 +195,8 @@ class UEC256ShapeMapper:
                 height_ratio=0.8,
                 volume_modifier=0.9,
                 typical_serving_cm3=350,
+                liquid_ratio=0.6,
+                solid_ratio=0.4,
                 sub_components=["broth", "various_items"]
             ),
             "sukiyaki": ShapePrior(
@@ -181,6 +204,8 @@ class UEC256ShapeMapper:
                 height_ratio=0.7,
                 volume_modifier=0.9,
                 typical_serving_cm3=400,
+                liquid_ratio=0.5,
+                solid_ratio=0.5,
                 sub_components=["broth", "meat", "vegetables", "tofu"]
             ),
             "shabu_shabu": ShapePrior(
@@ -188,6 +213,8 @@ class UEC256ShapeMapper:
                 height_ratio=0.8,
                 volume_modifier=0.95,
                 typical_serving_cm3=450,
+                liquid_ratio=0.55,
+                solid_ratio=0.45,
                 sub_components=["broth", "meat", "vegetables"]
             ),
 
@@ -280,6 +307,8 @@ class UEC256ShapeMapper:
                 height_ratio=0.7,
                 volume_modifier=0.9,
                 typical_serving_cm3=200,
+                liquid_ratio=0.4,
+                solid_ratio=0.6,
                 sub_components=["jelly", "fruits", "mochi", "red_bean"]
             ),
 
@@ -320,6 +349,8 @@ class UEC256ShapeMapper:
                 shape=FoodShape.BOWL_CONTENT,
                 height_ratio=0.5,
                 volume_modifier=0.9,
+                liquid_ratio=0.2,
+                solid_ratio=0.8,
                 typical_serving_cm3=100
             ),
 
@@ -342,6 +373,8 @@ class UEC256ShapeMapper:
                 height_ratio=0.7,
                 volume_modifier=0.95,
                 typical_serving_cm3=250,
+                liquid_ratio=0.65,
+                solid_ratio=0.35,
                 sub_components=["tofu", "sauce", "meat"]
             ),
             "okonomiyaki": ShapePrior(
@@ -365,7 +398,7 @@ class UEC256ShapeMapper:
             return self.category_map["default"]
         """Get shape prior for a given food category"""
         # Clean the input category string
-        category = food_category.lower().strip().replace(" ","_")
+        category = re.sub(r'\s+', '_', food_category.lower().strip())
         prior = self.category_map.get(category)
         if prior is None:
             logging.info(f"No shape prior found for '{food_category}', using default")
@@ -377,6 +410,8 @@ class UEC256ShapeMapper:
                             typical_serving_cm3:Optional[float] = None,
                             sub_components:Optional[List[str]] = None) -> None:
         """Add a custom food category with its shape prior"""
+        if height_ratio <= 0 or volume_modifier <= 0:
+            raise ValueError("height_ratio and volume_modifier must be positive values")
         category = category.lower().strip().replace(" ", "_")
         if category in self.category_map:
             logging.warning(f"Overwritting existing category '{category}'")
