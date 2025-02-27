@@ -330,7 +330,7 @@ class UECVolumeEstimator:
 
         volume_modifier = getattr(prior, "volume_modifier", 0.8)
         return volume * volume_modifier
-    
+
     @staticmethod
     def _estimate_irregular_volume(depth_map:np.ndarray, mask:np.ndarray,
                                    area_cm2: float, prior:ShapePrior,

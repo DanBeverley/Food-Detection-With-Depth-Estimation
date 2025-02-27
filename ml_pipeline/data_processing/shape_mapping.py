@@ -400,10 +400,20 @@ class UEC256ShapeMapper:
         # Clean the input category string
         category = re.sub(r'\s+', '_', food_category.lower().strip())
         prior = self.category_map.get(category)
-        if prior is None:
-            logging.info(f"No shape prior found for '{food_category}', using default")
-            prior = self.category_map["default"]
-        return prior
+        if prior is not None:
+            return prior
+        keywords = category.split("_")
+        for keyword in keywords:
+            if len(keyword) < 3: # For skipping short words
+                continue
+            matches  = [cat for cat in self.category_map.keys()
+                        if keyword in cat.split("_") and cat != "default"]
+            if matches:
+                best_match = matches[0]
+                logging.info(f"No exact match for '{food_category}', using '{best_match}' based on keyword '{keyword}'")
+                return self.category_map[best_match]
+        logging.info(f"No shape prior found for '{food_category}', using default")
+        return self.category_map["default"]
 
     def add_custom_category(self, category:str, shape:FoodShape,
                             height_ratio:float, volume_modifier:float,

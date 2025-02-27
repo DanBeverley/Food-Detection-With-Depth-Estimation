@@ -247,12 +247,18 @@ class UECFoodDataset(Dataset):
                 height, width = image.shape[0], image.shape[1]
 
             yolo_boxes = []
-            for (x1, y1, x2, y2) in bboxes:
+            for (x1, y1, x2, y2) in valid_bboxes:
+                if x1 >= x2 or y1 >= y2 or x1 < 0 or y1 < 0 or x2 > width or y2 > height:
+                    logging.warning(f"Invalid box coordinates: ({x1}, {y1}, {x2}, {y2}) for sample {idx}")
+                    continue
                 x_center = ((x1 + x2) / 2) / width
                 y_center = ((y1 + y2) / 2) / height
                 w = (x2 - x1) / width
                 h = (y2 - y1) / height
                 yolo_boxes.append([x_center, y_center, w, h])
+            if not yolo_boxes:
+                logging.warning(f"No valid boxes for sample {idx}, using fallback")
+                return self._get_fallback_sample()
 
             target = {"bboxes":torch.tensor(yolo_boxes, dtype=torch.float32),
                       "labels":torch.tensor(valid_labels, dtype=torch.int64),
@@ -274,8 +280,7 @@ class UECFoodDataset(Dataset):
         return volume*shape_prior.volume_modifier
 
 # Custom Collate Function
-def collate_fn(batch:Iterable[Tuple[torch.Tensor,
-               Dict[str, torch.Tensor]]]) -> Tuple[torch.Tensor, Dict[str, Any]]:
+def collate_fn(batch:Iterable[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]) -> Tuple[torch.Tensor, Dict[str, Any]]:
     image = []
     detection_targets = []
     nutrition_targets = []
