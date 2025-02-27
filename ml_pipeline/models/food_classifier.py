@@ -10,13 +10,17 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 import torch.cuda
 from ml_pipeline.data_processing.dataset_loader import UECFoodDataset
-from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
 from torchvision.datasets import ImageFolder
+from torchvision.transforms import ToTensor, Compose
+from torch.utils.tensorboard import SummaryWriter
 from multitask_foodnet import MultiTaskFoodNet
 import matplotlib.pyplot as plt
+
+pool_dataset = ImageFolder("unlabeled_pool_path", transform=Compose([ToTensor()]))
+pool_loader = DataLoader(pool_dataset, batch_size=32, shuffle = False)
 
 class ActiveLearner:
     def __init__(self, base_dataset:UECFoodDataset, unlabeled_pool:Union[str, Path]) -> None :
@@ -76,6 +80,8 @@ class FoodClassifier:
         # Quantization
         if quantized:
             self.quantize()
+        else:
+            self.model = self.model.to(self.device)
         self.active_learner = active_learner
         self.unlabeled_pool = []
         self.label_smoothing = label_smoothing
@@ -121,15 +127,17 @@ class FoodClassifier:
             img = np.array(image.convert("RGB"))
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
-            img = (img*255).astype(np.uint8)
         # Convert to tensor with explicit channel dimension
         tensor = self.transform(Image.fromarray(img))
         if tensor.shape[0]!=3:
-            tensor = tensor[:3] # Force 3 channels
-            raise ValueError(
-                f"Invalid channel dimension: {tensor.shape[0]}"
-                "Expected 3-channel RGB image"
-            )
+            # First check, then handle, then raise if needed
+            if tensor.shape[0] > 3:
+               tensor = tensor[:3] # Force 3 channels
+            else:
+                raise ValueError(
+                    f"Invalid channel dimension: {tensor.shape[0]}"
+                    "Expected 3-channel RGB image"
+                )
         return tensor.to(self.device)
 
     @staticmethod
@@ -161,34 +169,34 @@ class FoodClassifier:
 
         with torch.no_grad():
             output = self.model(x)
-            probabilities = torch.nn.functional.softmax(output, dim=1)
+            class_output = output["class"]
+            probabilities = torch.nn.functional.softmax(class_output, dim=1)
         # Get top prediction
         prob, class_idx = torch.max(probabilities, dim=1)
+        return {"class_id":int(class_idx.item()),
+                "confidence":float(prob.item()),
+                "nutrition":output["nutrition"][0].cpu().tolist()}
 
-        return {"class_id":int(class_idx),
-                "confidence":float(prob)}
-
-    def get_uncertain_samples(self, pool_loader:DataLoader, top_k:int=100) -> List[Any]:
+    def get_uncertain_samples(self, pool_loader:DataLoader, num_samples:int) -> List[Any]:
         """Identify top-k most uncertain samples"""
         uncertainties = []
-        indices = []
+        sample_paths = []
         with torch.inference_mode():
             for batch_idx, (images, _) in enumerate(pool_loader):
-                outputs = self.model(images.to(self.device))
+                if not isinstance(images, torch.Tensor):
+                    raise TypeError(f"Expected images as tensors, got {type(images)}")
+                outputs = self.model(images.to(self.device))["class"]
                 probs = F.softmax(outputs, dim=1)
-                batch_uncertainties = (-probs * torch.log2(probs + 1e-10)).sum(dim=1).cpu().numpy()
-                uncertainties.extend(batch_uncertainties)
-                batch_indices = list(range(batch_idx * pool_loader.batch_size,
-                                           min((batch_idx + 1) * pool_loader.batch_size,
-                                               len(pool_loader.dataset))))
-                indices.extend(batch_indices)
-        sorted_indices = np.argsort(uncertainties)[-top_k:]
-        selected_indices = [indices[i] for i in sorted_indices]
-        return [pool_loader.dataset[i] for i in selected_indices]
+                batch_uncertainties = -torch.sum(probs * torch.log(probs + 1e-10),dim=1)
+                uncertainties.extend(batch_uncertainties.cpu().tolist())
+                sample_paths.extend([f"sample_{i}" for i in range(len(images))])
+        # Sort by uncertainty and return top num_samples
+        indices = np.argsort(uncertainties)[-num_samples:]
+        return [sample_paths[i] for i in indices]
 
     def active_learning_step(self, pool_loader:DataLoader, human_labeler:Callable) -> None:
         # 1. Get uncertain samples
-        samples = self.get_uncertain_samples(pool_loader)
+        samples = self.get_uncertain_samples(pool_loader = pool_loader, num_samples = 100)
         # 2. Human labeling
         labeled_data = human_labeler(samples)
         # 3. Update training set
@@ -197,7 +205,9 @@ class FoodClassifier:
         else:
             raise ValueError("Active learner not initialized")
         # 4. Retrain
-        self.train(get_train_transforms(), get_val_transforms())
+        train_loader = DataLoader(self.active_learner.current_dataset, batch_size=32, shuffle=True)
+
+        self.train(train_loader, None)
 
     def quantize(self) -> None:
         self.model = quantize_dynamic(self.model.to("cpu"),
@@ -206,7 +216,7 @@ class FoodClassifier:
         self.model.to(self.device)
 
     def train(self, train_loader:DataLoader, val_loader:Optional[DataLoader],
-              epochs:int=100, learning_rate:float=0.001) -> None:
+              epochs:int=100, learning_rate:float=0.001, patience:int=5) -> None:
         """
         Train the classifier
         Args:
@@ -215,7 +225,8 @@ class FoodClassifier:
             epochs: Number of training epochs
             learning_rate: Learning rate
         """
-        if self.active_learner:
+        self.writer = SummaryWriter()
+        if self.active_learner and train_loader is None:
             train_loader = DataLoader(self.active_learner.current_dataset,
                                       batch_size = 32, shuffle=True, pin_memory=True,
                                       persistent_workers=True)
@@ -225,14 +236,14 @@ class FoodClassifier:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
                                                                patience=5, factor=0.5)
         best_val_loss = float("inf")
-
+        epochs_no_improve = 0
         for epoch in range(epochs):
             # Training
             train_loss = self._train_epoch(train_loader, optimizer,
                                            class_criterion, nutrition_criterion)
 
             # Validation
-            val_class_loss, val_nutrition_loss, val_accuracy = self._validate_epoch(val_loader, class_criterion, nutrition_criterion)
+            val_class_loss, val_nutrition_loss, val_accuracy, nutrition_error = self._validate_epoch(val_loader, class_criterion, nutrition_criterion)
             val_loss = self.class_loss_weight*val_class_loss+self.nutrition_loss_weight*val_nutrition_loss
             # Update learning rate
             scheduler.step(val_loss)
@@ -240,8 +251,13 @@ class FoodClassifier:
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                epochs_no_improve = 0
                 torch.save(self.model.state_dict(), "best_model.pth")
-
+            else:
+                epochs_no_improve+=1
+                if epochs_no_improve>=patience:
+                    print(f"Early stopping at epoch {epoch + 1}")
+                    break
             print(f"Epoch {epoch + 1}/{epochs}:")
             print(f"Train Loss: {train_loss:.4f}")
             print(f"Val Class Loss: {val_class_loss:.4f} |"
@@ -273,7 +289,7 @@ class FoodClassifier:
         return total_loss / len(train_loader)
 
     def _validate_epoch(self, val_loader:DataLoader, class_criterion:Callable[[Tensor, Tensor], Tensor],
-                        nutrition_criterion:Callable[[Tensor, Tensor], Tensor]) -> Tuple[float, float, float]:
+                        nutrition_criterion:Callable[[Tensor, Tensor], Tensor]) -> tuple[float, float, float, Any]:
         self.model.eval()
         total_class_loss = 0
         total_nutrition_loss = 0
@@ -296,7 +312,8 @@ class FoodClassifier:
         avg_class_loss = total_class_loss/len(val_loader)
         avg_nutrition_loss = total_nutrition_loss/len(val_loader)
         accuracy = 100.*correct/total
-        return avg_class_loss, avg_nutrition_loss, accuracy
+        nutrition_error = (outputs["nutrition"]-nutrition).abs().mean().item()
+        return avg_class_loss, avg_nutrition_loss, accuracy, nutrition_error
 
 
 

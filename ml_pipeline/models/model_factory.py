@@ -19,7 +19,8 @@ def create_backbone(arch:str="mobilenet_v3_small", pretrained:bool=True) -> nn.S
     else: # MobileNetV3/DenseNet etc.
         return nn.Sequential(*list(model.children())[:-1])
 
-def create_multitask_head(in_features: int, num_outputs: int = 4) -> nn.Sequential:
+def create_multitask_head(in_features: int, num_outputs: int = 4,
+                          activation:str="sigmoid") -> nn.Sequential:
     """
     Create nutrition estimation head.
     Args:
@@ -28,12 +29,12 @@ def create_multitask_head(in_features: int, num_outputs: int = 4) -> nn.Sequenti
     Returns:
         nn.Sequential: Nutrition estimation head.
     """
-    return nn.Sequential(
-        nn.Linear(in_features, 256),
-        nn.ReLU(),
-        nn.Linear(256, num_outputs),
-        nn.Sigmoid()  # Assumes nutrition values are normalized to [0,1]
-    )
+    activation_layer = nn.Sigmoid() if activation=="sigmoid" else nn.ReLU() if activation == "relu" else None
+    layers = [nn.Linear(in_features, 256),
+              nn.ReLU(), nn.Linear(256, num_outputs)]
+    if activation_layer:
+        layers.append(activation_layer)
+    return nn.Sequential(*layers)
 
 def get_feature_dim(backbone: nn.Module, input_size: Tuple[int, int, int] = (3, 224, 224)) -> int:
     """

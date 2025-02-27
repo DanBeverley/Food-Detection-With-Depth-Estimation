@@ -2,7 +2,6 @@ from typing import Optional, List, Union, Dict, Tuple
 
 import torch
 import numpy as np
-from tensorrt_bindings import ExecutionContextAllocationStrategy
 from torch.utils.data import DataLoader
 import pycuda.driver as cuda
 import pycuda.autoinit
@@ -29,7 +28,7 @@ class FoodDetector:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.use_trt = False # Flag to indicate TensorRT usage
         try:
-            self.model = YOLO(model_path if model_path and Path(model_path).exists() else "yolov8n.pt")
+            self.model = YOLO(model_path if model_path and Path(model_path).exists() else "yolov8n.pt").to(self.device)
             self.model.to(self.device)
         except Exception as e:
             logging.error(f"Error loading model: {e}")
@@ -63,9 +62,10 @@ class FoodDetector:
             if Path("yolov8.trt").exists():
                 self.trt_logger = trt.Logger(trt.Logger.WARNING)
                 self.trt_engine = self._load_trt_engine()
-                self.context = self.trt_engine.create_execution_context(strategy=ExecutionContextAllocationStrategy)
+                self.context = self.trt_engine.create_execution_context()
                 self.input_shape = self.trt_engine.get_binding_shape(0)
                 self._allocate_buffers()
+                self.use_trt = True
                 logging.info("TensorRT engine loaded successfully")
             else:
                 logging.warning("TensorRT engine not found, using Pytorch model")
@@ -80,7 +80,7 @@ class FoodDetector:
             self.inputs = []
             self.outputs = []
 
-    def __del__(self) -> None:
+    def close(self) -> None:
         """Safe cleaning of CUDA resources"""
         if self.trt_engine:
             del self.trt_engine
@@ -92,14 +92,22 @@ class FoodDetector:
 
     def detect_batch(self, images:Union[str, np.ndarray], batch_size:int=32) -> List[Dict[str, Union[List, float, int]]]:
         """Process images in batches"""
+        if not isinstance(images, (list, np.ndarray)):
+            raise ValueError("Images must be a list or numpy array")
         results = []
         for i in range(0, len(images), batch_size):
             batch = images[i:i + batch_size]
-            batch_results = self.model(batch, conf=self.conf_threshold, verbose=False)
-            for result, img in zip(batch_results, batch):
-                original_shape = img.shape[:2] if isinstance(img, np.ndarray) else cv2.imread(img).shape[:2]
-                processed = self._process_results(result, return_masks=False, original_shape=original_shape)
-                results.extend(processed)
+            if self.use_trt:
+                batch_results = [self._infer_trt(img, return_masks=False) for img in batch]
+            else:
+                batch_results = self.model(batch, conf=self.conf_threshold, verbose=False)
+                batch_results = [self._process_results(result, return_masks=False,
+                                                       original_shape=cv2.imread(img).shape[:2] if isinstance(img,
+                                                                                                              str) else img.shape[
+                                                                                                                        :2])
+                                 for result, img in zip(batch_results, batch)]
+            for image_detections in batch_results:
+                results.extend(image_detections)
         return results
 
     @staticmethod
@@ -122,9 +130,14 @@ class FoodDetector:
     def build_trt_engine(self, output_path="yolov8.trt"):
         """Export YOLOv8 to TensorRT engine with proper optimization"""
         #Export YOLO model ONNX first
-        onnx_path = "yolov8.onnx"
-        self.model.export(format="onnx", dynamic=True)
-        ModelOptimizer.export_tensorrt(onnx_path, output_path=output_path)
+        try:
+            onnx_path = "yolov8.onnx"
+            self.model.export(format="onnx", dynamic=True)
+            ModelOptimizer.export_tensorrt(onnx_path, output_path=output_path)
+            logging.info(f"TensorRT engine built and saved to {output_path}")
+        except Exception as e:
+            logging.error(f"Failed to build TensorRT engine: {e}")
+            raise
 
     def _preprocess(self, image:Union[str, np.ndarray]) -> np.ndarray:
         """Preprocess image for TensorRT inference"""
@@ -161,6 +174,8 @@ class FoodDetector:
 
     def _infer_trt(self, image:Union[str, np.ndarray], return_masks:bool) -> List[Dict[str, Union[np.ndarray, float, int]]]:
         # Placeholder for TensorRT inference
+        if not self.context or not self.trt_engine:
+            raise RuntimeError("TensorRT not properly initialized")
         preprocessed = self._preprocess(image)
         # Copy preprocessed image to device memory
         np.copyto(self.inputs[0]["host"], preprocessed.ravel())
@@ -170,8 +185,42 @@ class FoodDetector:
         for output in self.outputs:
             cuda.memcpy_dtoh_async(output["host"], output["device"], self.stream)
         self.stream.synchronize()
-        return self._process_results(self.outputs[0]["host"],
-                                     return_masks, image.shape[:2])
+        raw_output = self.outputs[0]["host"]
+        return self._parse_trt_output(raw_output, return_masks, image.shape[:2])
+
+    def _parse_trt_output(self, raw_output:np.ndarray, return_masks:bool, original_shape:Tuple)->List[Dict[str, Union[np.ndarray, float, int]]]:
+        """
+        Parse raw TensorRT output into detection dictionaries.
+
+        Args:
+            raw_output: Raw output from TensorRT engine (e.g., [num_detections, 7]).
+            return_masks: Whether to include masks (not supported here).
+            original_shape: Original image shape (height, width).
+
+        Returns:
+            List of detection dictionaries with keys 'bbox', 'confidence', and 'class_id'.
+        """
+        detections = []
+        for det in raw_output:
+            confidence = det[6]
+            if confidence < self.conf_threshold:
+                continue
+            # Convert normalized coordinates to absolute values
+            x_center = det[2] * original_shape[1]  # x_center * width
+            y_center = det[3] * original_shape[0]  # y_center * height
+            width = det[4] * original_shape[1]  # width * width
+            height = det[5] * original_shape[0]  # height * height
+            # Compute bounding box corners
+            x1 = x_center - width/2
+            y1 = y_center - height/2
+            x2 = x_center + width/2
+            y2 = y_center + height/2
+            detection = {"bbox":[x1, y1, x2, y2],
+                         "confidence":float(confidence),
+                         "class_id":int(det[1])}
+            detections.append(detection)
+        return detections
+
     @staticmethod
     def _process_results(result, return_masks:bool,
                          original_shape:Tuple) -> List[Dict[str, Union[np.ndarray, float, int]]]:
