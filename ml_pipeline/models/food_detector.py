@@ -15,7 +15,7 @@ import cv2
 
 class FoodDetector:
     def __init__(self, model_path:Optional[str]=None, confidence:float=0.5,
-                 device:Optional[torch.device]=None,
+                 device:Optional[Union[str,torch.device]]=None,
                  half_precision:bool=True, quantized:bool=False):
         """
        Initialize the food detector with YOLOv8
@@ -24,26 +24,43 @@ class FoodDetector:
            confidence: Detection confidence threshold
            device: Device to run model on ('cuda', 'cpu', etc.)
        """
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, str):
+            self.device = torch.device(device)
+        else:
+            self.device = device
+        self.inputs = []
+        self.outputs = []
+        self.stream = cuda.Stream() if torch.cuda.is_available() else None
+        self.bindings = []
+        self.input_shape = (3, 640, 640)
+        self.trt_engine = None
+        self.context = None
         self.conf_threshold = confidence
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.use_trt = False # Flag to indicate TensorRT usage
+
         try:
             self.model = YOLO(model_path if model_path and Path(model_path).exists() else "yolov8n.pt").to(self.device)
             self.model.to(self.device)
         except Exception as e:
             logging.error(f"Error loading model: {e}")
             raise
+
         # Quantization
         if quantized:
             self.quantize()
+
         # Half precision optimization
         if half_precision and torch.cuda.is_available() and device.type == "cuda":
             self.model = self.model.half()
+
         self._setup_tensorrt()
     def _load_trt_engine(self) -> trt.ICudaEngine:
         """Load pre-built TensorRT engine"""
         with open("yolov8.trt", "rb") as f, trt.Runtime(self.trt_logger) as runtime:
             return runtime.deserialize_cuda_engine(f.read())
+
     def _allocate_buffers(self) -> None:
         """Allocate input/output buffers for TensorRT"""
         self.bindings = []
@@ -57,6 +74,7 @@ class FoodDetector:
                 self.inputs.append({"host": host_mem, "device": device_mem})
             else:
                 self.outputs.append({"host": host_mem, "device": device_mem})
+
     def _setup_tensorrt(self) -> None:
         try:
             if Path("yolov8.trt").exists():
@@ -91,23 +109,43 @@ class FoodDetector:
                 cuda.memfree(buf["device"])
 
     def detect_batch(self, images:Union[str, np.ndarray], batch_size:int=32) -> List[Dict[str, Union[List, float, int]]]:
-        """Process images in batches"""
-        if not isinstance(images, (list, np.ndarray)):
-            raise ValueError("Images must be a list or numpy array")
+        """
+        Process images in batches
+
+        Args:
+        images: List of image paths or numpy arrays
+        batch_size: Batch size for processing
+
+        Returns:
+        List of detection results for all images
+        """
+        if not isinstance(images, (list, tuple, np.ndarray)):
+            raise ValueError("Images must be a list, tuple or numpy array")
+
         results = []
         for i in range(0, len(images), batch_size):
             batch = images[i:i + batch_size]
             if self.use_trt:
                 batch_results = [self._infer_trt(img, return_masks=False) for img in batch]
             else:
-                batch_results = self.model(batch, conf=self.conf_threshold, verbose=False)
-                batch_results = [self._process_results(result, return_masks=False,
-                                                       original_shape=cv2.imread(img).shape[:2] if isinstance(img,
-                                                                                                              str) else img.shape[
-                                                                                                                        :2])
-                                 for result, img in zip(batch_results, batch)]
-            for image_detections in batch_results:
-                results.extend(image_detections)
+                batch_predictions = self.model(batch, conf=self.conf_threshold, verbose=False)
+                batch_results = []
+                for j, (img, pred) in enumerate(zip(batch, batch_predictions)):
+                    # Get original image shape for proper scaling
+                    if isinstance(img, list):
+                        img_shape = cv2.imread(img).shape[:2] if Path(img).exists() else (640,640)
+                    else:
+                        img_shape = img.shape[:2]
+                    # Process single result - handle both list and single result cases
+                    if isinstance(pred, list):
+                        detections = self._process_results(pred[0], return_masks=False,
+                                                           original_shape=img_shape)
+                    else:
+                        detections = self._process_results(pred, return_masks=False,
+                                                              original_shape=img_shape)
+                    batch_results.append(detections)
+            for detection_list in batch_results:
+                results.extend(detection_list if isinstance(detection_list, list) else [detection_list])
         return results
 
     @staticmethod
@@ -201,24 +239,39 @@ class FoodDetector:
             List of detection dictionaries with keys 'bbox', 'confidence', and 'class_id'.
         """
         detections = []
-        for det in raw_output:
-            confidence = det[6]
-            if confidence < self.conf_threshold:
-                continue
-            # Convert normalized coordinates to absolute values
-            x_center = det[2] * original_shape[1]  # x_center * width
-            y_center = det[3] * original_shape[0]  # y_center * height
-            width = det[4] * original_shape[1]  # width * width
-            height = det[5] * original_shape[0]  # height * height
-            # Compute bounding box corners
-            x1 = x_center - width/2
-            y1 = y_center - height/2
-            x2 = x_center + width/2
-            y2 = y_center + height/2
-            detection = {"bbox":[x1, y1, x2, y2],
-                         "confidence":float(confidence),
-                         "class_id":int(det[1])}
-            detections.append(detection)
+        if raw_output.ndim == 1:
+            try:
+                raw_output = raw_output.reshape(-1, 7) # Try standard format
+            except ValueError:
+                logging.error("Could not reshape TensorRT output to expected format")
+                return []
+        # Filter by confidence threshold
+        valid_detections = raw_output[raw_output[:,6] >= self.conf_threshold]
+        for det in valid_detections:
+            try:
+                confidence = det[6]
+                try:
+                    if confidence < self.conf_threshold:
+                        continue
+                    # Convert normalized coordinates to absolute values
+                    x_center = det[2] * original_shape[1]  # x_center * width
+                    y_center = det[3] * original_shape[0]  # y_center * height
+                    width = det[4] * original_shape[1]  # width * width
+                    height = det[5] * original_shape[0]  # height * height
+                    # Compute bounding box corners
+                    x1 = x_center - width/2
+                    y1 = y_center - height/2
+                    x2 = x_center + width/2
+                    y2 = y_center + height/2
+                except IndexError:
+                    logging.warning("Invalid detection format - check TensorRT output structure")
+                    continue
+                detection = {"bbox":[float(x1), float(y1), float(x2), float(y2)],
+                             "confidence":float(confidence),
+                             "class_id":int(det[1])}
+                detections.append(detection)
+            except Exception as e:
+                logging.error(f"Error parsing detection: {e}")
         return detections
 
     @staticmethod

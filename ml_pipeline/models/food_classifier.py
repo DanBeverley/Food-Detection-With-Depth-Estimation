@@ -157,8 +157,13 @@ class FoodClassifier:
             dict with class probabilities
         """
         # Optional: Convert from numpy array to PIL
-        if isinstance(image, np.ndarray):
+        if isinstance(image, (str, Path)):
+            image = Image.open(image).convert("RGB")
+        elif isinstance(image, np.ndarray):
             image = Image.fromarray(image)
+        elif not isinstance(image, Image.Image):
+            raise TypeError(f"Unsupported image type: {type(image)},"
+                            f"expected numpy array, PIL image, or path")
         # Crop region using bbox
         x1, y1, x2, y2 = map(int, bbox)
         crop = image.crop((x1, y1, x2, y2))
@@ -194,7 +199,16 @@ class FoodClassifier:
         indices = np.argsort(uncertainties)[-num_samples:]
         return [sample_paths[i] for i in indices]
 
-    def active_learning_step(self, pool_loader:DataLoader, human_labeler:Callable) -> None:
+    def active_learning_step(self, pool_loader:DataLoader, human_labeler:Callable,
+                             val_split:float=0.2) -> None:
+        """
+        Perform one step of active learning
+
+        Args:
+            pool_loader: DataLoader for the unlabeled pool
+            human_labeler: Function to get human labels for samples
+            val_split: Percentage of labeled data to use for validation
+        """
         # 1. Get uncertain samples
         samples = self.get_uncertain_samples(pool_loader = pool_loader, num_samples = 100)
         # 2. Human labeling
@@ -204,10 +218,19 @@ class FoodClassifier:
             self.active_learner.update_dataset(labeled_data)
         else:
             raise ValueError("Active learner not initialized")
-        # 4. Retrain
-        train_loader = DataLoader(self.active_learner.current_dataset, batch_size=32, shuffle=True)
+        # 4. Splitting
+        dataset = self.active_learner.current_dataset
+        dataset_size = len(dataset)
+        indices = list(range(dataset_size))
 
-        self.train(train_loader, None)
+        import random
+        random.shuffle(indices)
+
+        val_size = int(np.floor(val_split*dataset_size))
+        train_indices, val_indices = indices[val_size:], indices[:val_size]
+        train_loader = DataLoader(Subset(dataset, train_indices), batch_size=32, shuffle=True)
+        val_loader = DataLoader(Subset(dataset, val_indices), batch_size=32, shuffle=False)
+        self.train(train_loader, val_loader)
 
     def quantize(self) -> None:
         self.model = quantize_dynamic(self.model.to("cpu"),
