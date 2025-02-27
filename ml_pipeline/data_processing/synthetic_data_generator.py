@@ -28,7 +28,7 @@ class FoodGANDataset(Dataset):
         self.mask_dir = self.root_dir/mask_dir
         self.transform = transform or get_gan_transforms()
 
-        self.mask_paths = {p.stem:p for p in self.mask_dir.glob(".png")}
+        self.mask_paths = {p.stem:p for p in self.mask_dir.glob("*.png")}
         self.image_paths = [p for p in self.image_dir.rglob(f"*{image_ext}")
                             if p.stem in self.mask_paths]
         if not self.image_paths:
@@ -191,9 +191,16 @@ class GANTrainer:
         else:
             food_categories = ["default_food"]
         fake_label = np.random.choice(food_categories)
+
+        nutrition = {}
         if self.nutrition_mapper:
-            nutrition = self.nutrition_mapper.map_food_label_to_nutrition(fake_label)
-        else:
+            try:
+                nutrition = self.nutrition_mapper.map_food_label_to_nutrition(fake_label) or {}
+            except Exception as e:
+                logging.warning(f"Failed to get nutrition for {fake_label}: {e}")
+                nutrition = {}
+
+        if not nutrition:
             nutrition = NutritionMapper.get_default_nutrition()
 
         if generation_params is None:
@@ -323,21 +330,24 @@ class GANTrainer:
         for name, value in epoch_losses.items():
             self.writer.add_scalar(f'epoch/loss_{name}', value, epoch)
         # Generate and log sample images
-        with torch.no_grad():
-            fake_images = self.netG(self.fixed_noise)
-            grid = torchvision.utils.make_grid(fake_images, normalize=True)
-            self.writer.add_image('generated_samples', grid, epoch)
-        # Log learning rates
-        self.writer.add_scalar('epoch/lr_G', self.optimG.param_groups[0]['lr'], epoch)
-        self.writer.add_scalar('epoch/lr_D', self.optimD.param_groups[0]['lr'], epoch)
-        # Save samples
-        sample_filename = f"epoch_{epoch + 1}.png"
-        self._save_samples(fake_images, sample_filename)
-        self._save_metadata(epoch, sample_filename, {
-            'losses': epoch_losses,
-            'lr_G': self.optimG.param_groups[0]['lr'],
-            'lr_D': self.optimD.param_groups[0]['lr']
-        })
+        try:
+            with torch.no_grad():
+                fake_images = self.netG(self.fixed_noise)
+                grid = torchvision.utils.make_grid(fake_images, normalize=True)
+                self.writer.add_image('generated_samples', grid, epoch)
+            # Log learning rates
+            self.writer.add_scalar('epoch/lr_G', self.optimG.param_groups[0]['lr'], epoch)
+            self.writer.add_scalar('epoch/lr_D', self.optimD.param_groups[0]['lr'], epoch)
+            # Save samples
+            sample_filename = f"epoch_{epoch + 1}.png"
+            self._save_samples(fake_images, sample_filename)
+            self._save_metadata(epoch, sample_filename, {
+                'losses': epoch_losses,
+                'lr_G': self.optimG.param_groups[0]['lr'],
+                'lr_D': self.optimD.param_groups[0]['lr']
+            })
+        except Exception as e:
+            logging.error(f"Error generating or saving samples in epoch {epoch}: {e}")
 
     def _save_samples(self, fake_images: torch.Tensor, filename: str):
         """
