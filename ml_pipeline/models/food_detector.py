@@ -1,8 +1,9 @@
-from typing import Optional, List, Union, Dict, Tuple
+from typing import Optional, List, Union, Dict, Tuple, Any
 
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
+from torch.ao.quantization import quantize_dynamic
 import pycuda.driver as cuda
 import pycuda.autoinit
 
@@ -108,7 +109,7 @@ class FoodDetector:
             if self.device in buf:
                 cuda.memfree(buf["device"])
 
-    def detect_batch(self, images:Union[str, np.ndarray], batch_size:int=32) -> List[Dict[str, Union[List, float, int]]]:
+    def detect_batch(self, images:Union[str, np.ndarray], batch_size:int=32) -> list[list[dict[str, list | float | int]] | list[Any]]:
         """
         Process images in batches
 
@@ -123,29 +124,21 @@ class FoodDetector:
             raise ValueError("Images must be a list, tuple or numpy array")
 
         results = []
-        for i in range(0, len(images), batch_size):
-            batch = images[i:i + batch_size]
-            if self.use_trt:
-                batch_results = [self._infer_trt(img, return_masks=False) for img in batch]
-            else:
-                batch_predictions = self.model(batch, conf=self.conf_threshold, verbose=False)
-                batch_results = []
-                for j, (img, pred) in enumerate(zip(batch, batch_predictions)):
-                    # Get original image shape for proper scaling
-                    if isinstance(img, list):
-                        img_shape = cv2.imread(img).shape[:2] if Path(img).exists() else (640,640)
-                    else:
-                        img_shape = img.shape[:2]
-                    # Process single result - handle both list and single result cases
-                    if isinstance(pred, list):
-                        detections = self._process_results(pred[0], return_masks=False,
-                                                           original_shape=img_shape)
-                    else:
-                        detections = self._process_results(pred, return_masks=False,
-                                                              original_shape=img_shape)
+        total_images = len(images)
+        num_batches = (total_images + batch_size - 1) // batch_size
+        for batch_idx in range(num_batches):
+            batch = images[batch_idx * batch_size:(batch_idx + 1) * batch_size]
+            batch_results = []
+            for img in batch:
+                try:
+                    detections = self.detect(img, return_masks=False)
+                    if not detections:
+                        logging.warning("No detections found for image: %s", img)
                     batch_results.append(detections)
-            for detection_list in batch_results:
-                results.extend(detection_list if isinstance(detection_list, list) else [detection_list])
+                except Exception as e:
+                    logging.error("Error processing image: %s. Error: %s", img, e)
+                    batch_results.append([])
+            results.extend(batch_results)
         return results
 
     @staticmethod
@@ -170,8 +163,9 @@ class FoodDetector:
         #Export YOLO model ONNX first
         try:
             onnx_path = "yolov8.onnx"
-            self.model.export(format="onnx", dynamic=True)
-            ModelOptimizer.export_tensorrt(onnx_path, output_path=output_path)
+            self.model.export(format="onnx", dynamic=True, save_half = torch.cuda.is_available())
+            ModelOptimizer.export_onnx(self.model, (3,640,640), onnx_path)
+            ModelOptimizer.export_tensorrt(onnx_path,(3,640,640), output_path=output_path)
             logging.info(f"TensorRT engine built and saved to {output_path}")
         except Exception as e:
             logging.error(f"Failed to build TensorRT engine: {e}")
@@ -181,12 +175,13 @@ class FoodDetector:
         """Preprocess image for TensorRT inference"""
         # Resize and Normalize
         h, w = image.shape[:2]
-        scale = min(self.input_shape[1]/w, self.input_shape[2]/h)
-        new_size = (int(w * scale), int(h * scale))
-        img = cv2.resize(image, new_size)
-        img = np.pad(img, ((0, self.input_shape[1]-new_size[1]),
-                           (0, self.input_shape[2] - new_size[0]), (0,0)))
-        return img.transpose(2,0,1).astype(np.float32)/255.0
+        r = min(self.input_shape[1]/w, self.input_shape[2]/h)
+        new_w, new_h = int(w*r), int(h*r)
+        image_resized = cv2.resize(image, (new_w, new_h))
+        image_padded = np.zeros((self.input_shape[1], self.input_shape[2], 3), dtype=image.dtype)
+        image_padded[:new_h, :new_w, :] = image_resized
+        image_padded = image_padded.transpose((2,0,1)).astype(np.float32)/255.0
+        return image_padded
 
     def detect(self, image:Union[str, np.ndarray],
                return_masks:bool=False) -> List[Dict[str, Union[List, float, int]]]:
@@ -226,12 +221,12 @@ class FoodDetector:
         raw_output = self.outputs[0]["host"]
         return self._parse_trt_output(raw_output, return_masks, image.shape[:2])
 
-    def _parse_trt_output(self, raw_output:np.ndarray, return_masks:bool, original_shape:Tuple)->List[Dict[str, Union[np.ndarray, float, int]]]:
+    def _parse_trt_output(self, raw_outputs:np.ndarray, return_masks:bool, original_shape:Tuple)->List[Dict[str, Union[np.ndarray, float, int]]]:
         """
         Parse raw TensorRT output into detection dictionaries.
 
         Args:
-            raw_output: Raw output from TensorRT engine (e.g., [num_detections, 7]).
+            raw_outputs: Raw output from TensorRT engine (e.g., [num_detections, 7]).
             return_masks: Whether to include masks (not supported here).
             original_shape: Original image shape (height, width).
 
@@ -239,63 +234,92 @@ class FoodDetector:
             List of detection dictionaries with keys 'bbox', 'confidence', and 'class_id'.
         """
         detections = []
-        if raw_output.ndim == 1:
-            try:
-                raw_output = raw_output.reshape(-1, 7) # Try standard format
-            except ValueError:
-                logging.error("Could not reshape TensorRT output to expected format")
-                return []
-        # Filter by confidence threshold
-        valid_detections = raw_output[raw_output[:,6] >= self.conf_threshold]
-        for det in valid_detections:
-            try:
-                confidence = det[6]
-                try:
-                    if confidence < self.conf_threshold:
-                        continue
-                    # Convert normalized coordinates to absolute values
-                    x_center = det[2] * original_shape[1]  # x_center * width
-                    y_center = det[3] * original_shape[0]  # y_center * height
-                    width = det[4] * original_shape[1]  # width * width
-                    height = det[5] * original_shape[0]  # height * height
-                    # Compute bounding box corners
-                    x1 = x_center - width/2
-                    y1 = y_center - height/2
-                    x2 = x_center + width/2
-                    y2 = y_center + height/2
-                except IndexError:
-                    logging.warning("Invalid detection format - check TensorRT output structure")
-                    continue
-                detection = {"bbox":[float(x1), float(y1), float(x2), float(y2)],
-                             "confidence":float(confidence),
-                             "class_id":int(det[1])}
-                detections.append(detection)
-            except Exception as e:
-                logging.error(f"Error parsing detection: {e}")
+        detection_tensor = None
+        mask_tensor = None
+
+        for i, binding in enumerate(self.trt_engine):
+            shape = self.trt_engine.get_binding_shape(binding)
+            dtype = trt.nptype(self.trt_engine.get_binding_dtype(binding))
+            if "detections" in binding.lower() and "output" not in binding.lower():
+                detection_tensor = raw_outputs[i].reshape(shape).astype(dtype)
+            elif "masks" in binding.lower():
+                mask_tensor = raw_outputs[i].reshape(shape).astype(dtype)
+
+            # Process detection tensor
+        if detection_tensor is not None:
+            for det in detection_tensor:
+                # Assuming detection format: class_id, confidence, x1, y1, x2, y2
+                if det.size >= 6:
+                    class_id = int(det[0])
+                    confidence = det[1]
+                    x1 = det[2] * original_shape[1]
+                    y1 = det[3] * original_shape[0]
+                    x2 = det[4] * original_shape[1]
+                    y2 = det[5] * original_shape[0]
+
+                    if confidence >= self.conf_threshold:
+                        detection = {
+                            "bbox": [x1, y1, x2, y2],
+                            "confidence": confidence,
+                            "class_id": class_id
+                        }
+
+                        # Add mask if available
+                        if return_masks and mask_tensor is not None:
+                            # Assuming mask_tensor has shape (h, w)
+                            mask = mask_tensor.reshape(original_shape[0], original_shape[1])
+                            detection["mask"] = mask.astype(np.float32)
+
+                        detections.append(detection)
+
         return detections
 
-    @staticmethod
-    def _process_results(result, return_masks:bool,
+    def _process_results(self, result, return_masks:bool,
                          original_shape:Tuple) -> List[Dict[str, Union[np.ndarray, float, int]]]:
-        # Process results
+        """
+        Process results from YOLO model into detection dictionaries.
+
+        Args:
+            result: YOLO result object.
+            return_masks (bool): Include segmentation masks.
+            original_shape (tuple): Original image dimensions.
+
+        Returns:
+            list: List of detection dictionaries.
+        """
         detections = []
+        if result is None or result.is_empty:
+            return detections
         # YOLOv8 returns a single Results object for one image
         boxes = result.boxes.xyxy.cpu().numpy()
         confs = result.boxes.conf.cpu().numpy()
         classes = result.boxes.cls.cpu().numpy()
-        masks = result.masks if return_masks and hasattr(result, "masks") else None
+#        masks = result.masks if return_masks and hasattr(result, "masks") else None
+        masks = result.masks if return_masks and not result.is_only_xyxy else None
+        for i in range(len(boxes.shape[0])):
+            box = boxes[i].tolist()
+            confidence = confs[i].item()
+            class_id = int(classes[i].item())
+            if confidence < self.conf_threshold:
+                continue
 
-        for i in range(boxes.shape[0]):
-            box = boxes[i]
+            # Normalize coordinates to original image size
+            h, w = original_shape
+            x1, y1, x2, y2 = box
+            x1 = max(0, min(x1, w - 1))
+            y1 = max(0, min(y1, h - 1))
+            x2 = max(0, min(x2, w - 1))
+            y2 = max(0, min(y2, h - 1))
+
             detection = {
-                "bbox": tuple(box),
-                "confidence": float(confs[i]),
-                "class_id": int(classes[i])
+                "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                "confidence": confidence,
+                "class_id": class_id
             }
             if masks and return_masks:
                 mask = masks[i].data.cpu().numpy().squeeze()
                 # original_shape is (height, width), cv2.resize expects (width, height)
-                mask = cv2.resize(mask, original_shape[::-1], interpolation=cv2.INTER_NEAREST)
+                mask = cv2.resize(mask, (w,h), interpolation=cv2.INTER_NEAREST)
                 detection["mask"] = mask.astype(np.float32)
             detections.append(detection)
         if not detections:
@@ -323,8 +347,18 @@ class FoodDetector:
             """
         try:
             self.model = ModelOptimizer.quantize_model(self.model)
-        except NotImplementedError:
-            logging.warning("ModelOptimizer not implemented. Quantization skipped.")
+        except NotImplementedError as e:
+            logging.error(f"Quantization failed using ModelOptimizer: {e}")
+            logging.info("Falling back to PyTorch dynamic quantization...")
+            try:
+                self.model = quantize_dynamic(
+                    self.model.to('cpu'),
+                    {torch.nn.Linear, torch.nn.Conv2d},
+                    dtype=torch.qint8
+                )
+            except Exception as e:
+                logging.error(f"Dynamic quantization failed: {e}")
+                raise
 
     def train(self, data_yaml:str, epochs:int = 100, batch_size:int=16,
               image_size:int=640) -> None:
