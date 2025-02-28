@@ -8,8 +8,6 @@ from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
 from ml_pipeline.models.food_classifier import FoodClassifier, ActiveLearner
 from ml_pipeline.models.food_detector import FoodDetector
 
-#TODO: Remove redundant config file in train.py
-
 class FoodTrainingSystem:
     def __init__(self, cfg:dict):
         #self.config = self._validate_config(cfg = cfg)
@@ -233,12 +231,22 @@ class FoodTrainingSystem:
             not hasattr(self, 'qat_initialized')
         )
 
+    def _reinitialized_optimization(self):
+        """Reinitialize optimizer and gradient scaler with QAT-enabled parameters"""
+        self.optimizer = torch.optim.AdamW([{"params": self.classifier.model.parameters(), "lr":
+                                             self.config_params["training"]["learning_rate"]},
+                                            {"params":self.detector.model.parameters(), "lr":
+                                             self.config_params["training"]["learning_rate"]*0.1}], weight_decay=1e-4)
+        self.scaler = GradScaler()
     def _initialize_qat(self):
         """Initialize Quantization Aware Training"""
         self.detector.prepare_for_qat()
         self.classifier.prepare_for_qat()
+        self.classifier.calibrate_model(self.val_loader)
         self.detector.calibrate_model(self.val_loader)
-        self.quat_initialized = True
+        self._reinitialized_optimization()
+        self.qat_initialized = True
+        logging.info(f"Epoch {self.current_epoch}: Enabled Quantization-Aware Training (QAT)")
 
     def run_training(self):
         """Main training loop"""
@@ -251,7 +259,7 @@ class FoodTrainingSystem:
                 # Validation
                 val_loss = self.validate()
                 # Self-training: Periodically generate pseudo-labels and augment the dataset
-                if self.current_epoch * self.config_params["training"]["self_training_freq"] == 0:
+                if self.current_epoch % self.config_params["training"]["self.training_freq"]==0:
                     self._perform_self_training()
                 # Learning rate scheduling
                 self.scheduler.step(val_loss)
@@ -259,8 +267,8 @@ class FoodTrainingSystem:
                 if self._handle_validation_results(train_loss, val_loss):
                     break
                 # TensorRT export
-                if self._should_export_trt(epoch):
-                    self._export_trt_checkpoint(epoch)
+#                if self._should_export_trt(epoch):
+#                    self._export_trt_checkpoint(epoch)
         except Exception as e:
             self.logger.error(f"Training failed: {str(e)}")
             raise
@@ -273,6 +281,7 @@ class FoodTrainingSystem:
                                  batch_size = self.config_params["training"]["batch_size"], shuffle=False,
                                  num_workers = self.config_params["training"]["num_workers"], pin_memory=True)
         pseudo_labels = self.classifier.pseudo_label_samples(pool_loader, confidence_threshold=0.95)
+        logging.info(f"Added {len(pseudo_labels)} pseudo-labeled samples")
         # Update active learner with pseudo labeled data
         self.classifier.active_learner.update_with_pseudo_labels(pseudo_labels)
         # Recreate training DataLoader
@@ -368,7 +377,4 @@ if __name__ == "__main__":
         }
     }
     system = FoodTrainingSystem(config)
-    if torch.cuda.is_available():
-        asyncio.run(system.run_training())
-    else:
-        system.run_training()
+    system.run_training()

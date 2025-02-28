@@ -67,7 +67,6 @@ class FoodClassifier:
         else:
             self.model = self.model.to(self.device)
         self.active_learner = active_learner
-        self.unlabeled_pool = []
         self.label_smoothing = label_smoothing
         self.model = self.model.to(self.device)
 
@@ -315,12 +314,10 @@ class FoodClassifier:
 
         return avg_class_loss, avg_nutrition_loss, accuracy, nutrition_error_avg
 
-
-        avg_class_loss = total_class_loss/len(val_loader)
-        avg_nutrition_loss = total_nutrition_loss/len(val_loader)
-        accuracy = 100.*correct/total
-        nutrition_error = (outputs["nutrition"]-nutrition).abs().mean().item()
-        return avg_class_loss, avg_nutrition_loss, accuracy, nutrition_error
-
-
-
+    def calibrate_model(self, data_loader:DataLoader):
+        """Calibrate the model for QAT by running a forward pass on representative data"""
+        self.model.eval()
+        with torch.no_grad():
+            for images, _ in data_loader:
+                images = images.to(self.device)
+                self.model(images)
