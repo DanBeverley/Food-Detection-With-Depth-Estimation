@@ -5,7 +5,7 @@ from tqdm import tqdm
 from configs.config_loader import get_params
 from ml_pipeline.data_processing.dataset_loader import *
 from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
-from ml_pipeline.models.food_classifier import FoodClassifier, ActiveLearner, human_labeling_interface
+from ml_pipeline.models.food_classifier import FoodClassifier, ActiveLearner
 from ml_pipeline.models.food_detector import FoodDetector
 
 #TODO: Remove redundant config file in train.py
@@ -195,9 +195,6 @@ class FoodTrainingSystem:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
-        # Active learning
-        if self.config_params["training"]["active_learning"] and batch_idx % 100 == 0:
-            self._active_learning_step()
 
         return loss.item()
 
@@ -249,20 +246,18 @@ class FoodTrainingSystem:
         try:
             for epoch in range(self.config_params["training"]["epochs"]):
                 self.current_epoch = epoch
-
                 # Training
                 train_loss = self.train_epoch(epoch)
-
                 # Validation
                 val_loss = self.validate()
-
+                # Self-training: Periodically generate pseudo-labels and augment the dataset
+                if self.current_epoch * self.config_params["training"]["self_training_freq"] == 0:
+                    self._perform_self_training()
                 # Learning rate scheduling
                 self.scheduler.step(val_loss)
-
                 # Model saving and early stopping
                 if self._handle_validation_results(train_loss, val_loss):
                     break
-
                 # TensorRT export
                 if self._should_export_trt(epoch):
                     self._export_trt_checkpoint(epoch)
@@ -271,6 +266,20 @@ class FoodTrainingSystem:
             raise
         finally:
             self.logger.info("Training completed")
+
+    def _perform_self_training(self):
+        """Generate pseudo labels and update the dataset"""
+        pool_loader = DataLoader(self.classifier.active_learner.unlabeled_pool,
+                                 batch_size = self.config_params["training"]["batch_size"], shuffle=False,
+                                 num_workers = self.config_params["training"]["num_workers"], pin_memory=True)
+        pseudo_labels = self.classifier.pseudo_label_samples(pool_loader, confidence_threshold=0.95)
+        # Update active learner with pseudo labeled data
+        self.classifier.active_learner.update_with_pseudo_labels(pseudo_labels)
+        # Recreate training DataLoader
+        self.train_loader = torch.utils.data.DataLoader(
+            self.classifier.active_learner.current_dataset, batch_size=self.config_params["training"]["batch_size"],
+            shuffle=True, num_workers=self.config_params["training"]["num_workers"], persistent_workers=True,
+            pin_memory=True if self.device.type == "cuda" else False, drop_last=True)
 
     def validate(self):
         self.classifier.model.eval()
@@ -340,17 +349,6 @@ class FoodTrainingSystem:
                                        output_path=f"detector_epoch_{epoch}.trt")
         ModelOptimizer.export_tensorrt(self.classifier.model, input_shape=(3, 256, 256),
                                        output_path=f"classifier_epoch_{epoch}.trt")
-
-    def _active_learning_step(self):
-        if not self.classifier.active_learner.unlabeled_pool:
-            logging.info("Unlabeled pool is empty. Skipping active learning step")
-            return
-        pool_loader = DataLoader(self.classifier.active_learner.unlabeled_pool, batch_size=32,
-                                 num_workers = self.config_params["training"]["num_workers"], shuffle=True,
-                                 pin_memory=True)
-        samples = self.classifier.get_uncertain_samples(pool_loader)
-        labeled_data = human_labeling_interface(samples)
-        self.classifier.active_learner.update_dataset(labeled_data)
 
 if __name__ == "__main__":
     config = {

@@ -1,10 +1,11 @@
 from pathlib import Path
-from typing import Any, Union, Iterable, Tuple, List, Optional, Dict, Callable
+from typing import Any, Union, Tuple, List, Optional, Dict, Callable
 
 import cv2
 
 from PIL import Image
 import numpy as np
+from datasets import tqdm
 
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -14,39 +15,22 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import transforms
 from torch.quantization import quantize_dynamic
 from torchvision.datasets import ImageFolder
-from torchvision.transforms import ToTensor, Compose
 from torch.utils.tensorboard import SummaryWriter
 from multitask_foodnet import MultiTaskFoodNet
-import matplotlib.pyplot as plt
-
-pool_dataset = ImageFolder("unlabeled_pool_path", transform=Compose([ToTensor()]))
-pool_loader = DataLoader(pool_dataset, batch_size=32, shuffle = False)
 
 class ActiveLearner:
     def __init__(self, base_dataset:UECFoodDataset, unlabeled_pool:Union[str, Path]) -> None :
         self.base_dataset = base_dataset
         self.unlabeled_pool = ImageFolder(unlabeled_pool, transform=base_dataset.transform)
-        self.labeled_food = set()
-    def update_dataset(self, new_samples:Iterable[Any]) -> None:
-        self.labeled_food.update(new_samples)
-        self.current_dataset = ConcatDataset([self.base_dataset,
-                                              Subset(self.unlabeled_pool, list(self.labeled_food))])
-
-def display_image(img:Union[np.ndarray, Image.Image]) -> None:
-    plt.figure(figsize=(8,8))
-    plt.imshow(img)
-    plt.axis("off")
-    plt.show()
-
-def human_labeling_interface(samples: Iterable[Tuple[Union[np.ndarray, Image.Image], Any]])\
-        -> List[Tuple[Union[np.ndarray, Image.Image], str]]:
-    labeled = []
-    for img, pred in samples:
-        display_image(img)
-        true_label = input(f"Model Predicted {pred}. Enter correct label: ")
-        labeled.append((img, true_label))
-    return labeled
-
+        self.pseudo_labeled = set()
+    def update_with_pseudo_labels(self, pseudo_labeled_data: List[Tuple[str, int]]):
+        """Add pseudo-labeled samples to the training dataset"""
+        for path, label in pseudo_labeled_data:
+            self.pseudo_labeled.add((path, label))
+        self.current_dataset = ConcatDataset([
+            self.base_dataset,
+            Subset(self.unlabeled_pool, list(self.pseudo_labeled))
+        ])
 
 class FoodClassifier:
     def __init__(self, model_path:Optional[str]=None, num_classes:int=256,
@@ -140,11 +124,12 @@ class FoodClassifier:
                 )
         return tensor.to(self.device)
 
-    @staticmethod
-    def prepare_for_qat() -> None:
+    def prepare_for_qat(self) -> None:
         """Modify model for quantization-aware training"""
         from pytorch_quantization import quant_modules
         quant_modules.initialize()
+        self.model.qconfig = torch.quantization.get_default_qconfig("x86")
+        torch.quantization.prepare_qat(self.model, inplace = True)
 
     def classify_crop(self, image:Union[np.ndarray, Image.Image],
                       bbox: Tuple[float, float ,float, float]) -> Dict[str, Union[int, float]]:
@@ -182,55 +167,42 @@ class FoodClassifier:
                 "confidence":float(prob.item()),
                 "nutrition":output["nutrition"][0].cpu().tolist()}
 
-    def get_uncertain_samples(self, pool_loader:DataLoader, num_samples:int) -> List[Any]:
+    def get_uncertain_samples(self, pool_loader:DataLoader, num_samples:int, export_path:str) -> List[Any]:
         """Identify top-k most uncertain samples"""
         uncertainties = []
         sample_paths = []
         with torch.inference_mode():
-            for batch_idx, (images, _) in enumerate(pool_loader):
+            for batch_idx, (images, _, paths) in enumerate(pool_loader):
                 if not isinstance(images, torch.Tensor):
                     raise TypeError(f"Expected images as tensors, got {type(images)}")
-                outputs = self.model(images.to(self.device))["class"]
+
+                images = images.to(self.device)
+                outputs = self.model(images)["class"]
                 probs = F.softmax(outputs, dim=1)
                 batch_uncertainties = -torch.sum(probs * torch.log(probs + 1e-10),dim=1)
+
                 uncertainties.extend(batch_uncertainties.cpu().tolist())
-                sample_paths.extend([f"sample_{i}" for i in range(len(images))])
-        # Sort by uncertainty and return top num_samples
-        indices = np.argsort(uncertainties)[-num_samples:]
-        return [sample_paths[i] for i in indices]
+                sample_paths.extend(paths)
 
-    def active_learning_step(self, pool_loader:DataLoader, human_labeler:Callable,
-                             val_split:float=0.2) -> None:
-        """
-        Perform one step of active learning
+            indices = np.argsort(uncertainties)[-num_samples:]
+            selected_paths = [sample_paths[i] for i in indices]
+            with open(export_path, "w") as f:
+                f.write("\n".join(selected_paths))
 
-        Args:
-            pool_loader: DataLoader for the unlabeled pool
-            human_labeler: Function to get human labels for samples
-            val_split: Percentage of labeled data to use for validation
-        """
-        # 1. Get uncertain samples
-        samples = self.get_uncertain_samples(pool_loader = pool_loader, num_samples = 100)
-        # 2. Human labeling
-        labeled_data = human_labeler(samples)
-        # 3. Update training set
-        if self.active_learner is not None:
-            self.active_learner.update_dataset(labeled_data)
-        else:
-            raise ValueError("Active learner not initialized")
-        # 4. Splitting
-        dataset = self.active_learner.current_dataset
-        dataset_size = len(dataset)
-        indices = list(range(dataset_size))
+            return selected_paths
 
-        import random
-        random.shuffle(indices)
-
-        val_size = int(np.floor(val_split*dataset_size))
-        train_indices, val_indices = indices[val_size:], indices[:val_size]
-        train_loader = DataLoader(Subset(dataset, train_indices), batch_size=32, shuffle=True)
-        val_loader = DataLoader(Subset(dataset, val_indices), batch_size=32, shuffle=False)
-        self.train(train_loader, val_loader)
+    def pseudo_label_samples(self, pool_loader:DataLoader, confidence_threshold:float=0.9,)-> List[Tuple[str, int]]:
+        """Generate pseudo-labels for samples above a confidence threshold"""
+        pseudo_labeled = []
+        with torch.inference_mode():
+            for images, _, paths in tqdm(pool_loader, desc = "Generating pseudo-labels"):
+                outputs = self.model(images.to(self.device))["class"]
+                probs = F.softmax(outputs, dim = 1)
+                max_probs, predictions = torch.max(probs, dim = 1)
+                for i in range(len(paths)):
+                    if max_probs[i] >= confidence_threshold:
+                        pseudo_labeled.append((paths[i], predictions[i].item()))
+        return pseudo_labeled
 
     def quantize(self) -> None:
         self.model = quantize_dynamic(self.model.to("cpu"),
@@ -316,6 +288,7 @@ class FoodClassifier:
         self.model.eval()
         total_class_loss = 0
         total_nutrition_loss = 0
+        total_nutrition_error = 0
         correct = 0
         total = 0
         with torch.inference_mode():
@@ -326,12 +299,23 @@ class FoodClassifier:
                 outputs = self.model(images)
                 class_loss = class_criterion(outputs["class"], labels)
                 nutrition_loss = nutrition_criterion(outputs["nutrition"], nutrition)
+                nutrition_error_part = (outputs["nutrition"] - nutrition).abs().mean().item()
 
                 total_class_loss += class_loss.item()
                 total_nutrition_loss += nutrition_loss.item()
+                total_nutrition_error += nutrition_error_part
+
                 _, predicted = outputs["class"].max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
+        avg_class_loss = total_class_loss / len(val_loader)
+        avg_nutrition_loss = total_nutrition_loss / len(val_loader)
+        accuracy = 100.0 * correct/total
+        nutrition_error_avg = total_nutrition_error / len(val_loader) if len(val_loader) > 0 else 0.0
+
+        return avg_class_loss, avg_nutrition_loss, accuracy, nutrition_error_avg
+
+
         avg_class_loss = total_class_loss/len(val_loader)
         avg_nutrition_loss = total_nutrition_loss/len(val_loader)
         accuracy = 100.*correct/total

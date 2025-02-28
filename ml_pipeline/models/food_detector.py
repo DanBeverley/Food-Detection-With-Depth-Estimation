@@ -302,11 +302,12 @@ class FoodDetector:
             logging.warning("No detections were found...")
         return detections
 
-    @staticmethod
-    def prepare_for_qat():
+    def prepare_for_qat(self):
         """Modify model for quantization-aware training"""
         from pytorch_quantization import quant_modules
         quant_modules.initialize()
+        self.model.qconfig = torch.quantization.get_default_qconfig("x86")
+        torch.quantization.prepare_qat(self.model, inplace=True)
 
     def calibrate_model(self, calib_loader:DataLoader) -> None:
         """Run calibration for INT8 quantization"""
