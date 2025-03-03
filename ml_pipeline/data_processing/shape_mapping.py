@@ -415,28 +415,3 @@ class UEC256ShapeMapper:
         logging.info(f"No shape prior found for '{food_category}', using default")
         return self.category_map["default"]
 
-    def add_custom_category(self, category:str, shape:FoodShape,
-                            height_ratio:float, volume_modifier:float,
-                            typical_serving_cm3:Optional[float] = None,
-                            sub_components:Optional[List[str]] = None) -> None:
-        """Add a custom food category with its shape prior"""
-        if height_ratio <= 0 or volume_modifier <= 0:
-            raise ValueError("height_ratio and volume_modifier must be positive values")
-        category = category.lower().strip().replace(" ", "_")
-        if category in self.category_map:
-            logging.warning(f"Overwritting existing category '{category}'")
-        self.category_map[category] = ShapePrior(shape = shape,
-                                                 height_ratio = height_ratio,
-                                                 volume_modifier = volume_modifier,
-                                                 typical_serving_cm3 = typical_serving_cm3,
-                                                 sub_components = sub_components)
-
-    def get_similar_categories(self, food_category:str, threshold:float=0.2)->List[str]:
-        """Find similar food categories based on shape categories"""
-        target_prior = self.get_shape_prior(food_category)
-        similar_categories = []
-        for category, prior in self.category_map.items():
-            if (prior.shape == target_prior.shape and
-                    abs(prior.height_ratio-target_prior.height_ratio)<threshold):
-                similar_categories.append(category)
-        return similar_categories

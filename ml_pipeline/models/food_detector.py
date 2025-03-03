@@ -131,13 +131,16 @@ class FoodDetector:
             batch_results = []
             for img in batch:
                 try:
-                    detections = self.detect(img, return_masks=False)
+                    if self.use_trt:
+                        detections = self._infer_trt(img, return_masks = True)
+                    else:
+                        detections = self.detect(img, return_masks=False)
                     if not detections:
                         logging.warning("No detections found for image: %s", img)
                     batch_results.append(detections)
                 except Exception as e:
                     logging.error("Error processing image: %s. Error: %s", img, e)
-                    batch_results.append([])
+                    batch_results.append({})
             results.extend(batch_results)
         return results
 
@@ -233,46 +236,50 @@ class FoodDetector:
         Returns:
             List of detection dictionaries with keys 'bbox', 'confidence', and 'class_id'.
         """
-        detections = []
-        detection_tensor = None
-        mask_tensor = None
+        try:
+            detections = []
+            detection_tensor = None
+            mask_tensor = None
 
-        for i, binding in enumerate(self.trt_engine):
-            shape = self.trt_engine.get_binding_shape(binding)
-            dtype = trt.nptype(self.trt_engine.get_binding_dtype(binding))
-            if "detections" in binding.lower() and "output" not in binding.lower():
-                detection_tensor = raw_outputs[i].reshape(shape).astype(dtype)
-            elif "masks" in binding.lower():
-                mask_tensor = raw_outputs[i].reshape(shape).astype(dtype)
+            for i, binding in enumerate(self.trt_engine):
+                shape = self.trt_engine.get_binding_shape(binding)
+                dtype = trt.nptype(self.trt_engine.get_binding_dtype(binding))
+                if "detections" in binding.lower() and "output" not in binding.lower():
+                    detection_tensor = raw_outputs[i].reshape(shape).astype(dtype)
+                elif "masks" in binding.lower():
+                    mask_tensor = raw_outputs[i].reshape(shape).astype(dtype)
 
-            # Process detection tensor
-        if detection_tensor is not None:
-            for det in detection_tensor:
-                # Assuming detection format: class_id, confidence, x1, y1, x2, y2
-                if det.size >= 6:
-                    class_id = int(det[0])
-                    confidence = det[1]
-                    x1 = det[2] * original_shape[1]
-                    y1 = det[3] * original_shape[0]
-                    x2 = det[4] * original_shape[1]
-                    y2 = det[5] * original_shape[0]
+                # Process detection tensor
+            if detection_tensor is not None:
+                for det in detection_tensor:
+                    # Assuming detection format: class_id, confidence, x1, y1, x2, y2
+                    if det.size >= 6:
+                        class_id = int(det[0])
+                        confidence = det[1]
+                        x1 = det[2] * original_shape[1]
+                        y1 = det[3] * original_shape[0]
+                        x2 = det[4] * original_shape[1]
+                        y2 = det[5] * original_shape[0]
 
-                    if confidence >= self.conf_threshold:
-                        detection = {
-                            "bbox": [x1, y1, x2, y2],
-                            "confidence": confidence,
-                            "class_id": class_id
-                        }
+                        if confidence >= self.conf_threshold:
+                            detection = {
+                                "bbox": [x1, y1, x2, y2],
+                                "confidence": confidence,
+                                "class_id": class_id
+                            }
 
-                        # Add mask if available
-                        if return_masks and mask_tensor is not None:
-                            # Assuming mask_tensor has shape (h, w)
-                            mask = mask_tensor.reshape(original_shape[0], original_shape[1])
-                            detection["mask"] = mask.astype(np.float32)
+                            # Add mask if available
+                            if return_masks and mask_tensor is not None:
+                                # Assuming mask_tensor has shape (h, w)
+                                mask = mask_tensor.reshape(original_shape[0], original_shape[1])
+                                detection["mask"] = mask.astype(np.float32)
 
-                        detections.append(detection)
+                            detections.append(detection)
+            return detections
+        except Exception as e:
+            logging.error(f"Failed to parse TensorRT output: {e}")
+            raise
 
-        return detections
 
     def _process_results(self, result, return_masks:bool,
                          original_shape:Tuple) -> List[Dict[str, Union[np.ndarray, float, int]]]:
@@ -316,7 +323,7 @@ class FoodDetector:
                 "confidence": confidence,
                 "class_id": class_id
             }
-            if masks and return_masks:
+            if masks is not None and i < len(masks):
                 mask = masks[i].data.cpu().numpy().squeeze()
                 # original_shape is (height, width), cv2.resize expects (width, height)
                 mask = cv2.resize(mask, (w,h), interpolation=cv2.INTER_NEAREST)

@@ -3,6 +3,7 @@ import os
 from typing import Callable, Any, Optional, Iterable, List, Tuple
 
 import aiohttp
+import nest_asyncio
 
 from shape_mapping import UEC256ShapeMapper
 
@@ -19,6 +20,7 @@ from ml_pipeline.utils.transforms import get_train_transforms, get_val_transform
 from pathlib import Path
 import logging
 
+nest_asyncio.apply()
 class UECFoodDataset(Dataset):
     def __init__(self, root_dir:Optional[str]=None,
                  transform:Optional[Callable]=None, image_ext:str=".jpg",
@@ -57,12 +59,19 @@ class UECFoodDataset(Dataset):
         self.nutrition_mapper.session = session
         tasks = [self.nutrition_mapper.map_food_label_to_nutrition(cat)
                  for cat in self.id_to_category.values()]
-        loop = asyncio.get_event_loop()
-        results = loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        results = [] # To prevent UnboundLocalError
+        try:
+            # Use asyncio.run to encapsule even Loop management
+            loop = asyncio.get_event_loop()
+            results = loop.run_until_complete(asyncio.gather(*tasks, return_exceptions = True))
+        except Exception as e:
+            logging.error(f"Error loading nutrition data: {e}")
+        finally:
+            loop.run_until_complete(self.nutrition_mapper.close())
         # Process results
         for cat, result in zip(self.id_to_category.values(), results):
             if isinstance(result, Exception):
-                logging.warning(...)
+                logging.warning(f"Error mapping nutrition for {cat}: {result}")
                 self.nutrition_cache[cat] = self.nutrition_mapper.get_default_nutrition()
             else:
                 self.nutrition_cache[cat] = result
@@ -273,11 +282,24 @@ class UECFoodDataset(Dataset):
 
     def _estimate_portion(self, food_name:str, bbox_area:float) -> float:
         """Estimate portion (volume in ml) using food-specific density per pixel area"""
-        # density = self.nutrition_mapper.get_density(food_name) # g/pixel_area
         shape_prior = self.shape_mapper.get_shape_prior(food_name)
-        # Example : Dome shape food volume = area^(3/2) * height_ratio
-        volume = (bbox_area**1.5)*shape_prior.height_ratio
-        return volume*shape_prior.volume_modifier
+        if isinstance(shape_prior, dict):
+            shape_type = shape_prior.get("type", "domed")
+            height = shape_prior.get("height", 2.5)
+            volume_modifier = shape_prior.get("volume_modifier", 0.85)
+        else:
+            logging.error(f"Invalid shape_prior type: {type(shape_prior)}")
+            return 0.0
+        if shape_type == "cylindrical":
+            return bbox_area* height* volume_modifier
+        elif shape_type == "spherical":
+            radius = np.sqrt(bbox_area/np.pi)
+            return (4/3) * np.pi * (radius ** 2) * height
+        elif shape_type == "domed":
+            return (bbox_area ** 1.5) * height
+        else:
+            logging.warning(f"Unknown shape type: {shape_type}")
+            return (bbox_area ** 1.5) * 2.5 # Fallback
 
 # Custom Collate Function
 def collate_fn(batch:Iterable[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]) -> Tuple[torch.Tensor, Dict[str, Any]]:
@@ -296,24 +318,3 @@ def collate_fn(batch:Iterable[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]) -> 
     return (image, {"detection":detection_targets,
                      "nutrition":torch.stack(nutrition_targets,0)})
 
-
-# Creating DataLoaders
-dataset_root = ""
-train_dataset = UECFoodDataset(root_dir = dataset_root, transform = get_train_transforms())
-val_dataset = UECFoodDataset(root_dir = dataset_root, transform = get_val_transforms())
-train_loader = DataLoader(train_dataset, batch_size = 32,
-                           shuffle = True, num_workers = 4,
-                           pin_memory=True, collate_fn=collate_fn, persistent_workers=True)
-
-val_loader = DataLoader(val_dataset, batch_size=32,
-                        shuffle = False, num_workers = 4,
-                        pin_memory = True, collate_fn = collate_fn, persistent_workers=True)
-
-# Quick test: Retrieve one batch from the training loader.
-images, targets = next(iter(train_loader))
-print("Batch Images Shape:", images.shape)
-print("Example Target:", targets[0])
-
-# Optionally, print the category mapping (id-to-name) if available.
-if train_dataset.id_to_category is not None:
-    print("Category Mapping:", train_dataset.id_to_category)

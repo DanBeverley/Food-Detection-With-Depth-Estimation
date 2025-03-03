@@ -3,14 +3,13 @@ import logging
 import csv
 import os
 import asyncio
-
 import aiohttp
 from redis import Redis, ConnectionError as RedisConnectionError
-from typing import Optional, Dict, Any, cast
+from typing import Dict, Any, cast
 
 from tenacity import retry
-from tenacity import AsyncRetrying, wait_exponential, stop_after_attempt, retry_if_exception_type
-from aiohttp import ClientResponseError, ClientConnectionError
+from tenacity import wait_exponential, stop_after_attempt, retry_if_exception_type
+
 
 class TooManyRequestsError(Exception):
     pass
@@ -29,6 +28,7 @@ class NutritionMapper:
         self.base_url = "https://api.nal.usda.gov/fdc/v1/foods/search"
         self.redis = Redis.from_url(redis_url, decode_responses=True)
         self._verify_redis_connection()
+        self._request_semaphore = asyncio.Semaphore(5)
         self.cache = self._load_cache()
         self.density_db = {
             "rice": 0.05, "white rice": 0.05, "brown rice": 0.05, "bread": 0.03,
@@ -66,52 +66,45 @@ class NutritionMapper:
         return self
     async def __aexit__(self, exc_type: Any, exc_val:Any, exc_tb:Any) -> None:
         await self.close()
-    async def get_nutrition_data(self, query: str, max_results: int = 1) -> Optional[Dict[str, float]]:
+    async def get_nutrition_data(self, queries: str, max_concurrent: int = 5) -> Dict[str, Dict[str, float]]:
         """Async version of the USDA API call with Redis caching"""
-        cache_key = f"nutrition:{query.lower()}"
-        # Try Redis cache first
-        if self.redis:
-            try:
-                cached = self.redis.get(cache_key)
-                if cached:
-                    return json.loads(cached)
-            except RedisConnectionError:
-                logging.warning("Redis cache retrieval failed due to connection issue")
-        # Try local cache
-        if query.lower() in self.cache:
-            return self.cache[query.lower()]
-        # API call with retry logic
-        params = {
-            "api_key": self.api_key,
-            "query": query,
-            "pageSize": max_results
-        }
-        retry_config = {"wait":wait_exponential(multiplier=0.2, max=5),
-                        "stop":stop_after_attempt(3),
-                        "retry":(retry_if_exception_type(ClientConnectionError) |
-                                 retry_if_exception_type(ClientResponseError) |
-                                 retry_if_exception_type(TooManyRequestsError))}
+        async with self._request_semaphore:
+            results = {}
+            missing_queries = []
 
-        async for attempt in AsyncRetrying(**retry_config):
-            with attempt:
-                async with self.session.get(self.base_url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if "foods" in data and len(data["foods"])>0:
-                            nutritions = self._parse_nutrition_data(data["foods"][0])
-                            self._cache_data(query, nutritions)
-                            return nutritions
-                        else:
-                            logging.warning(f"No nutrition data found for query: {query}")
-                            return None
-                    elif response.status == 429:
-                        retry_after = response.headers.get("Retry-After", 1)
-                        logging.warning(f"HTTP 429: Too Many Requests. Retry-After: {retry_after} sec")
-                        raise TooManyRequestsError("Too many requests")
+            # Deduplicate queries
+            unique_queries = set(queries)
+            # Check cache
+            for query in unique_queries:
+                cache_key = f"Nutrition: {query.lower()}"
+                if query.lower() in self.cache:
+                    results[query] = self.cache[query.lower()]
+                    continue
+                # Redis after local cache
+                if self.redis:
+                    try:
+                        cached = self.redis.get(cache_key)
+                        if cached:
+                            results[query] = json.loads(cached)
+                            continue
+                    except RedisConnectionError:
+                        logging.warning("Redis connection failed")
+                missing_queries.append(query)
+            # Fetch missing data with concurrency limit
+            semaphore = asyncio.Semaphore(max_concurrent)
+            async def fetch_with_limit(query):
+                async with semaphore:
+                    return await self.get_nutrition_data(query)
+            if missing_queries:
+                tasks = [fetch_with_limit(query) for query in missing_queries]
+                fetched_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for query, result in zip(missing_queries, fetched_results):
+                    if isinstance(result, Exception):
+                        logging.error(f"Error fetching nutrition for {query}:{result}")
+                        results[query] = self.get_nutrition_data()
                     else:
-                        response.raise_for_status()
-        logging.error(f"Failed to retrieve nutrition data for {query} after retries")
-        return None
+                        results[query] = result
+            return results
 
     @staticmethod
     def _parse_nutrition_data(food_item: Dict[str, Any]) -> Dict[str, float]:
@@ -161,8 +154,16 @@ class NutritionMapper:
           logging.warning(f"No nutrition data found for {food_labels}, using default nutrition")
           return self.get_default_nutrition()
         density = self.density_db.get(food_labels.lower(), 0.05)
-        nutritions["calories_per_ml"] = (nutritions["calories"] / 100) * density
+        if not isinstance(density, (int, float)):
+            density = 0.05 # Fallback
+        try:
+            calories_per_ml = (nutritions["calories"] / 100.0) * density
+        except KeyError:
+            logging.error(f"Missing 'calories' key in nutritionm for {food_labels}")
+            calories_per_ml = 0.0
+        nutritions["calories_per_ml"] = float(calories_per_ml)
         return nutritions
+
     def get_density(self, food_name:str)->float:
         return self.density_db.get(food_name.lower(), 0.05)
 
@@ -192,19 +193,3 @@ class NutritionMapper:
                 "fat":0,
                 "carbohydrates":0,
                 "calories_per_ml":.5}
-
-if __name__ == "__main__":
-    API_KEY = "API_KEY"
-    mapper = NutritionMapper(api_key=API_KEY)
-
-    # Example: Map the food label 'rice' to its nutrition data.
-    food_label = "rice"
-    nutrition = asyncio.run(mapper.map_food_label_to_nutrition(food_label))
-    if nutrition:
-        print(f"Nutrition data for '{food_label}':")
-        print(f"Calories: {nutrition['calories']} kcal")
-        print(f"Protein: {nutrition['protein']} g")
-        print(f"Fat: {nutrition['fat']} g")
-        print(f"Carbohydrates: {nutrition['carbohydrates']} g")
-    else:
-        print(f"No nutrition data found for '{food_label}'.")
