@@ -21,8 +21,8 @@ from torch.nn.utils import spectral_norm
 from tqdm import tqdm
 
 class FoodGANDataset(Dataset):
-    def __init__(self, root_dir:str,image_dir:str,
-                 mask_dir:str, transform:Callable=None, image_ext:str=".jpg"):
+    def __init__(self, root_dir:str,image_dir:str="images",
+                 mask_dir:str="masks", transform:Callable=None, image_ext:str=".jpg"):
         self.root_dir = Path(root_dir)
         self.image_dir = self.root_dir/image_dir
         self.mask_dir = self.root_dir/mask_dir
@@ -39,13 +39,17 @@ class FoodGANDataset(Dataset):
     def __len__(self):
         return len(self.image_paths)
     def __getitem__(self, idx):
-        img = cv2.imread(str(self.image_paths[idx]))
-        if img is None:
-            raise FileNotFoundError(f"Image not found: {self.image_paths[idx]}")
-        mask = cv2.imread(str(self.mask_paths[self.image_paths[idx].stem]), cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise FileNotFoundError(f"Mask not found for {self.image_paths[idx]}")
-        return self.transform(image=np.array(img), mask = np.array(mask))
+        try:
+            img = cv2.imread(str(self.image_paths[idx]))
+            if img is None:
+                raise FileNotFoundError(f"Image not found: {self.image_paths[idx]}")
+            mask = cv2.imread(str(self.mask_paths[self.image_paths[idx].stem]), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise FileNotFoundError(f"Mask not found for {self.image_paths[idx]}")
+            return self.transform(image=np.array(img), mask = np.array(mask))
+        except Exception as e:
+            logging.warning(f"Skipping sample {self.image_paths[idx]}: {e}")
+            return self.__getitem__((idx + 1) % len(self))  # Return next valid sample
 
 class Generator(nn.Module):
     def __init__(self, nz:int=100, ngf:int=64, nc:int=3):
@@ -124,16 +128,17 @@ def compute_gradient_penalty(D:nn.Module, real_samples:torch.Tensor,
 # Training Loop with Mixed Precision, Gradient Penalty and TensorBoard Logging
 
 class GANTrainer:
-    def __init__(self, device:torch.cuda.device, nz:int=100, lr:float=0.0002,
-                 beta1:float=0.5, nutrition_mapper = None):
-        self.device = device if torch.cuda.is_available() else torch.device("cpu")
-        self.nz = nz
+    def __init__(self, config:dict , nutrition_mapper:NutritionMapper = None):
+        self.device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+        self.nz = config.get("nz", 100)
+        self.lr = config.get("lr", 0.0002)
+        self.beta1 = config.get("beta1", 0.5)
         self.nutrition_mapper = nutrition_mapper
-        self.netG = Generator(nz = nz).to(device=self.device)
+        self.netG = Generator(nz = self.nz).to(device=self.device)
         self.netD = Discriminator().to(device=self.device)
 
-        self.optimG = optim.Adam(self.netG.parameters(), lr=lr, betas=(beta1, 0.999))
-        self.optimD = optim.Adam(self.netD.parameters(), lr=lr, betas=(beta1, 0.999))
+        self.optimG = optim.Adam(self.netG.parameters(), lr=self.lr, betas=(self.beta1, 0.999))
+        self.optimD = optim.Adam(self.netD.parameters(), lr=self.lr, betas=(self.beta1, 0.999))
 
         self.schedulerG = optim.lr_scheduler.ReduceLROnPlateau(self.optimG, "min", patience = 5)
         self.schedulerD = optim.lr_scheduler.ReduceLROnPlateau(self.optimD, "min", patience = 5)
@@ -176,7 +181,7 @@ class GANTrainer:
             logging.error(f"Failed to initialize metadata file: {e}")
             raise RuntimeError("Metadata initialization failed")
 
-    def _save_metadata(self, epoch:int, sample_filename:str,
+    async def _save_metadata(self, epoch:int, sample_filename:str,
                        generation_params:dict=None):
         """
         Save metadata for generated samples with enhanced tracking
@@ -187,7 +192,7 @@ class GANTrainer:
             generation_params: Dictionary of generation parameters (optional)
         """
         if self.nutrition_mapper:
-            food_categories = list(self.nutrition_mapper.density_db.keys())
+            food_categories = await self.nutrition_mapper.map_food_label_to_nutrition(fake_label) or {}
         else:
             food_categories = ["default_food"]
         fake_label = np.random.choice(food_categories)
@@ -382,3 +387,13 @@ class GANTrainer:
         if is_best:
             best_path = "best_model.pt"
             torch.save(checkpoint, best_path)
+
+    def load_checkpoint(self, checkpoint_path:str):
+        checkpoint = torch.load(checkpoint_path, map_location = self.device)
+        self.netG.load_state_dict(checkpoint["G_state_dict"])
+        self.netD.load_state_dict(checkpoint["D_state_dict"])
+        self.optimG.load_state_dict(checkpoint["optimG_state_dict"])
+        self.optimD.load_state_dict(checkpoint["optimD_state_dict"])
+        self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        self.current_epoch = checkpoint["epoch"]
+        logging.info(f"Loaded checkpoint from {checkpoint_path} at epoch {self.current_epoch}")

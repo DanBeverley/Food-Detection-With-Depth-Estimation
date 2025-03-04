@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import Dataset
 from typing import Dict
 from ml_pipeline.data_processing.nutrition_mapper import NutritionMapper
-from ml_pipeline.utils.transforms import get_train_transforms, get_val_transforms
+from ml_pipeline.utils.transforms import get_train_transforms
 
 from pathlib import Path
 import logging
