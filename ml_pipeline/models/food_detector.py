@@ -43,7 +43,6 @@ class FoodDetector:
 
         try:
             self.model = YOLO(model_path if model_path and Path(model_path).exists() else "yolov8n.pt").to(self.device)
-            self.model.to(self.device)
         except Exception as e:
             logging.error(f"Error loading model: {e}")
             raise
@@ -51,12 +50,12 @@ class FoodDetector:
         # Quantization
         if quantized:
             self.quantize()
-
+            self.device = torch.device("cpu")
         # Half precision optimization
-        if half_precision and torch.cuda.is_available() and device.type == "cuda":
+        elif half_precision and torch.cuda.is_available() and self.device.type == "cuda":
             self.model = self.model.half()
-
         self._setup_tensorrt()
+
     def _load_trt_engine(self) -> trt.ICudaEngine:
         """Load pre-built TensorRT engine"""
         with open("yolov8.trt", "rb") as f, trt.Runtime(self.trt_logger) as runtime:
@@ -128,20 +127,25 @@ class FoodDetector:
         num_batches = (total_images + batch_size - 1) // batch_size
         for batch_idx in range(num_batches):
             batch = images[batch_idx * batch_size:(batch_idx + 1) * batch_size]
-            batch_results = []
-            for img in batch:
-                try:
-                    if self.use_trt:
-                        detections = self._infer_trt(img, return_masks = True)
-                    else:
-                        detections = self.detect(img, return_masks=False)
-                    if not detections:
-                        logging.warning("No detections found for image: %s", img)
-                    batch_results.append(detections)
-                except Exception as e:
-                    logging.error("Error processing image: %s. Error: %s", img, e)
-                    batch_results.append({})
-            results.extend(batch_results)
+            if self.use_trt:
+                # Preprocess batch for TensorRT
+                preprocessed_batch = np.stack([self._preprocess(self.preprocess_image(img)) for img in batch])
+                np.copyto(self.inputs[0]["host"], preprocessed_batch.ravel())
+                cuda.memcpy_htod_async(self.inputs[0]["device"], self.inputs[0]["host"], self.stream)
+                self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+                for output in self.outputs:
+                    cuda.memcpy_dtoh_async(output["host"], output["device"], self.stream)
+                self.stream.synchronize()
+                batch_results = self._parse_trt_output(self.outputs[0]["host"], return_masks=True,
+                                                       original_shape=batch[0].shape[:2])
+                results.extend([batch_results[i+i+1] for i in range(len(batch))]) # Split results per image
+            else:
+                # Preprocess batch for Pytorch
+                batch_images = [self.preprocess_image(img) for img in batch]
+                batch_tensor = torch.stack([torch.from_numpy(img).to(self.model.device) for img in batch_images])
+                batch_results = self.model(batch_tensor, conf=self.conf_threshold, verbose=False)
+                for i, single_result in enumerate(batch_results):
+                    results.append(self._process_results(single_result, return_masks=False, original_shape=batch[i].shape[:2]))
         return results
 
     @staticmethod
@@ -167,7 +171,6 @@ class FoodDetector:
         try:
             onnx_path = "yolov8.onnx"
             self.model.export(format="onnx", dynamic=True, save_half = torch.cuda.is_available())
-            ModelOptimizer.export_onnx(self.model, (3,640,640), onnx_path)
             ModelOptimizer.export_tensorrt(onnx_path,(3,640,640), output_path=output_path)
             logging.info(f"TensorRT engine built and saved to {output_path}")
         except Exception as e:
@@ -202,9 +205,10 @@ class FoodDetector:
             return self._infer_trt(image, return_masks)
         else:
             image = self.preprocess_image(image)
+            image_tensor = torch.from_numpy(image).to(self.model.device) if isinstance(image, np.ndarray) else image.to(self.model.device)
             # Run inference
             results = self.model(image, conf = self.conf_threshold,
-                                verbose=False, device=self.device)
+                                verbose=False)
             single_result = results[0]
             return self._process_results(single_result, return_masks, image.shape[:2])
 
@@ -238,43 +242,22 @@ class FoodDetector:
         """
         try:
             detections = []
-            detection_tensor = None
-            mask_tensor = None
-
-            for i, binding in enumerate(self.trt_engine):
-                shape = self.trt_engine.get_binding_shape(binding)
-                dtype = trt.nptype(self.trt_engine.get_binding_dtype(binding))
-                if "detections" in binding.lower() and "output" not in binding.lower():
-                    detection_tensor = raw_outputs[i].reshape(shape).astype(dtype)
-                elif "masks" in binding.lower():
-                    mask_tensor = raw_outputs[i].reshape(shape).astype(dtype)
-
+            detection_tensor = raw_outputs[0] if isinstance(raw_outputs, list) else raw_outputs
                 # Process detection tensor
-            if detection_tensor is not None:
-                for det in detection_tensor:
-                    # Assuming detection format: class_id, confidence, x1, y1, x2, y2
-                    if det.size >= 6:
-                        class_id = int(det[0])
-                        confidence = det[1]
-                        x1 = det[2] * original_shape[1]
-                        y1 = det[3] * original_shape[0]
-                        x2 = det[4] * original_shape[1]
-                        y2 = det[5] * original_shape[0]
-
-                        if confidence >= self.conf_threshold:
-                            detection = {
-                                "bbox": [x1, y1, x2, y2],
-                                "confidence": confidence,
-                                "class_id": class_id
-                            }
-
-                            # Add mask if available
-                            if return_masks and mask_tensor is not None:
-                                # Assuming mask_tensor has shape (h, w)
-                                mask = mask_tensor.reshape(original_shape[0], original_shape[1])
-                                detection["mask"] = mask.astype(np.float32)
-
-                            detections.append(detection)
+            for det in detection_tensor:
+                if det[1] >= self.conf_threshold: # Confidence check
+                    class_id = int(det[0])
+                    confidence = float(det[1])
+                    x1 = det[2] * original_shape[1]
+                    y1 = det[3] * original_shape[0]
+                    x2 = det[4] * original_shape[1]
+                    y2 = det[4] * original_shape[0]
+                    detection = {"bbox":[float(x1), float(y1), float(x2), float(y2)],
+                                 "confidence":confidence,
+                                 "class_id":class_id}
+                    if return_masks:
+                        logging.warning("Masks not supported in current TensorRT parsing")
+                    detections.append(detection)
             return detections
         except Exception as e:
             logging.error(f"Failed to parse TensorRT output: {e}")

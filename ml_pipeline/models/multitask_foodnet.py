@@ -67,28 +67,21 @@ class MultiTaskFoodNet(nn.Module):
         )
 
         # Expanded nutrition head with more explicit naming
-        self.nutrition_head = nn.Sequential(
-            nn.Linear(1024, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 4),  # 4 outputs: calories, protein, fat%, carbs%
-            nn.Sigmoid()  # Constrain outputs between 0-1 before scaling
-        )
+        self.nutrition_head = create_multitask_head(1024, 4, activation="relu")
 
         # Initialize scaling factors as registered buffers
         self.register_buffer('calories_scale', torch.tensor([calories_scale], dtype=torch.float))
         self.register_buffer('protein_scale', torch.tensor([protein_scale], dtype=torch.float))
 
-        # Initialize weights with Kaiming initialization
+        # Initialize weights with Xavier initialization due to sigmoid
         def init_weights(m: nn.Module) -> None:
             if isinstance(m, nn.Linear):
-                torch.nn.init.kaiming_normal_(m.weight)
+                torch.nn.init.xavier_normal_(m.weight)
                 if m.bias is not None:
-                    m.bias.data.fill_(0.01)
+                    m.bias.data.fill_(0.0)
 
         # Apply initialization
-        self.apply(init_weights)
-
+        self.nutrition_head.apply(init_weights)
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the network.
@@ -110,7 +103,7 @@ class MultiTaskFoodNet(nn.Module):
             # Handle input size mismatches
             _, c, h, w = x.shape
             if (c, h, w) != self.input_size:
-                logging.warning(f"Input size mismatch: got {(c, h, w)}, expected {self.input_size}")
+                raise ValueError(f"Input size mismatch: got {(c, h, w)}, expected {self.input_size}")
 
             # Extract features
             features = self.feature_extractor(x)

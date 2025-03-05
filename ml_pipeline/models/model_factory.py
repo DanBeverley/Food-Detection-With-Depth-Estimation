@@ -23,29 +23,11 @@ def create_backbone(arch:str="mobilenet_v3_small", pretrained:bool=True) -> nn.S
 
     # Handle deprecated 'pretrained' parameter in newer torchvision
     if weights_param == "weights" and pretrained:
-        import inspect
-        model_fn = getattr(torchvision.models, arch, None)
-        if model_fn is not None:
-            # Get the appropriate weights enum
-            signature = inspect.signature(model_fn)
-            if "weights" in signature.parameters:
-                weights_enum_name = f"{arch.upper().replace('_', '')}_Weights.IMAGENET1K_V1"
-                # Try to resolve the weights enum
-                try:
-                    weights_module = getattr(torchvision.models, f"{arch}_weights", None)
-                    if weights_module is not None:
-                        weights_enum = getattr(weights_module, "IMAGENET1K_V1", None)
-                        kwargs = {"weights": weights_enum}
-                    else:
-                        kwargs = {"weights": "IMAGENET1K_V1"}
-                except (AttributeError, ImportError):
-                    kwargs = {weights_param: pretrained}
-            else:
-                kwargs = {weights_param: pretrained}
-        else:
-            kwargs = {weights_param: pretrained}
-    else:
-        kwargs = {weights_param: pretrained}
+        try:
+            weights_enum = getattr(getattr(torchvision.models, f"{arch}_weights", "IMAGENET1K_V1"))
+            kwargs = {"weights":weights_enum}
+        except AttributeError:
+            kwargs ={"weights":"IMAGENET1K_V1"}
 
     # Create the model
     try:
@@ -53,7 +35,6 @@ def create_backbone(arch:str="mobilenet_v3_small", pretrained:bool=True) -> nn.S
             model = getattr(torchvision.models, arch)(**kwargs)
         else:
             raise ValueError(f"Invalid architecture: {arch}")
-
         # Handle different backbone structures based on architecture type
         if arch.startswith("resnet"):
             return nn.Sequential(*list(model.children())[:-2])  # Remove avg pool and fc
@@ -102,7 +83,9 @@ def create_multitask_head(in_features: int, num_outputs: int = 4,
     Returns:
         nn.Sequential: Nutrition estimation head.
     """
-    activation_layer = nn.Sigmoid() if activation=="sigmoid" else nn.ReLU() if activation == "relu" else None
+    activation_layer = {"sigmoid":nn.Sigmoid(),
+                        "relu":nn.ReLU(),
+                        None:None}.get(activation)
     layers = [nn.Linear(in_features, 256),
               nn.ReLU(), nn.Linear(256, num_outputs)]
     if activation_layer:
@@ -142,6 +125,4 @@ def get_feature_dim(backbone: nn.Module, input_size: Tuple[int, int, int] = (3, 
             else:
                 raise ValueError(f"Unexpected feature dimension: {features.dim()}")
     except Exception as e:
-        logging.error(f"Error determining feature dimensions: {e}")
-        # Fallback to a common dimension
-        return 2048
+        raise ValueError(f"Failed to determine feature dimensions: {e}")

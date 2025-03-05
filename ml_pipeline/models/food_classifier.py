@@ -59,8 +59,7 @@ class FoodClassifier:
 
         # Load train weights if provided
         if model_path and Path(model_path).exists():
-            self.model.load_state_dict(torch.load(model_path,
-                                                  map_location=self.device))
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         # Quantization
         if quantized:
             self.quantize()
@@ -68,8 +67,6 @@ class FoodClassifier:
             self.model = self.model.to(self.device)
         self.active_learner = active_learner
         self.label_smoothing = label_smoothing
-        self.model = self.model.to(self.device)
-
         # Setup image preprocessing
         self.transform = transforms.Compose([transforms.Resize(256),
                                              transforms.CenterCrop(256),
@@ -115,7 +112,9 @@ class FoodClassifier:
         if tensor.shape[0]!=3:
             # First check, then handle, then raise if needed
             if tensor.shape[0] > 3:
-               tensor = tensor[:3] # Force 3 channels
+                import logging
+                logging.warning(f"Image has {tensor.shape[0]} channels, slicing to 3 channels")
+                tensor = tensor[:3] # Force 3 channels
             else:
                 raise ValueError(
                     f"Invalid channel dimension: {tensor.shape[0]}"
@@ -167,7 +166,13 @@ class FoodClassifier:
                 "nutrition":output["nutrition"][0].cpu().tolist()}
 
     def get_uncertain_samples(self, pool_loader:DataLoader, num_samples:int, export_path:str) -> List[Any]:
-        """Identify top-k most uncertain samples"""
+        """Identify top-k most uncertain samples
+        Args:
+            pool_loader: DataLoader yielding (images, _, paths) tuples. Must provide file paths for samples.
+            num_samples: Number of uncertain samples to select.
+            export_path: Path to export selected sample paths.
+        Returns:
+            List of selected sample paths."""
         uncertainties = []
         sample_paths = []
         with torch.inference_mode():
@@ -204,10 +209,9 @@ class FoodClassifier:
         return pseudo_labeled
 
     def quantize(self) -> None:
-        self.model = quantize_dynamic(self.model.to("cpu"),
-                                      {nn.Linear, nn.Conv2d},
-                                      dtype=torch.qint8)
-        self.model.to(self.device)
+        if self.device.type != "cpu":
+            raise ValueError("Dynamic quantization is only supported on CPU")
+        self.model = quantize_dynamic(self.model.to("cpu"), {nn.Linear, nn.Conv2d}, dtype=torch.qint8)
 
     def train(self, train_loader:DataLoader, val_loader:Optional[DataLoader],
               epochs:int=100, learning_rate:float=0.001, patience:int=5) -> None:
@@ -219,6 +223,9 @@ class FoodClassifier:
             epochs: Number of training epochs
             learning_rate: Learning rate
         """
+        if self.model.device == "cpu" and self.device.type == "cuda":
+            raise RuntimeError("Training a quantized model on CPU with CUDA device specified. "
+                               "Set quantized=False for training or use CPU device")
         self.writer = SummaryWriter()
         if self.active_learner and train_loader is None:
             train_loader = DataLoader(self.active_learner.current_dataset,
@@ -315,7 +322,8 @@ class FoodClassifier:
         return avg_class_loss, avg_nutrition_loss, accuracy, nutrition_error_avg
 
     def calibrate_model(self, data_loader:DataLoader):
-        """Calibrate the model for QAT by running a forward pass on representative data"""
+        """Calibrate the model for QAT by running a forward pass on representative data,
+        Note: Typically used externally for PTQ, not called within this class"""
         self.model.eval()
         with torch.no_grad():
             for images, _ in data_loader:
