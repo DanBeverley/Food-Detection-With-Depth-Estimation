@@ -1,20 +1,22 @@
 import logging
 from pathlib import Path
-
+import hashlib
 import cv2
 import numpy as np
 import torch
 from scipy.spatial import ConvexHull
 from shape_mapping import ShapePrior
+from cachetools import LRUCache
 from ml_pipeline.data_processing.shape_mapping import UEC256ShapeMapper
 
 class HybridPortionEstimator:
-    def __init__(self, device=None, nutrition_mapper=None):
+    def __init__(self, device=None, nutrition_mapper=None, fallback_scale:float= 22/640):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.nutrition_mapper = nutrition_mapper
+        self.fallback_scale = fallback_scale
+        self.depth_cache = LRUCache(maxsize=100) # For a larger, more efficient caching
         self.depth_cache = {}
-        self._load_models()
-
+        self.models_loaded = False
         # Food type to density mapping (g/cm³)
         self.density_db = {
             'rice': 0.9,  # Cooked rice
@@ -22,28 +24,26 @@ class HybridPortionEstimator:
             'meat': 1.1,  # Cooked beef
             'vegetables': 0.6
         }
+        self._load_models()
 
     def _load_models(self):
         """Load both reference object detector and depth estimation model"""
+        if self.models_loaded:
+            return
         try:
-            if hasattr(self, "ref_detector") and hasattr(self, "midas"):
-                return
             # Load reference object detector (YOLOv8)
             yolov8_path = Path("models/yolov8n.pt")
             if yolov8_path.exists() and yolov8_path.is_file():
                 self.ref_detector = torch.hub.load('ultralytics/yolov8', 'custom', path=str(yolov8_path))
             else:
                 self.ref_detector = torch.hub.load("ultralytics/yolov8", 'yolov8n', pretrained=True)
-        except Exception as e:
-            logging.error(f"Failed to load YOLOv8: {e}")
-            raise RuntimeError("Reference detector loading failed")
-        try:
-            # Load MiDaS for depth estimation
             self.midas = torch.hub.load('intel-isl/MiDaS', 'MiDaS_small').to(self.device)
             self.midas_transform = torch.hub.load('intel-isl/MiDaS', 'transforms').small_transform
+            self.models_loaded = True
         except Exception as e:
-            logging.error(f"Failed to load MiDaS: {e}")
-            raise RuntimeError("Depth estimation model loading failed")
+            logging.error(f"Model loading failed: {e}")
+            raise RuntimeError("Failed to load models")
+
     def get_scale(self, image):
         """
         Compute the pixel-to-centimeter scale factor for an image.
@@ -54,6 +54,7 @@ class HybridPortionEstimator:
         ref_objects = self._detect_reference_objects(img_rgb)
         scale_ratio = self._calculate_scale(ref_objects, known_width_cm=8.5)
         return scale_ratio
+
     @staticmethod
     def _get_region_depth(depth_map, mask, box=None):
         """Get average depth in masked region"""
@@ -63,6 +64,7 @@ class HybridPortionEstimator:
             x1, y1, x2, y2 = map(int, box)
             valid_depths = depth_map[y1:y2,x1:x2].flatten()
         return np.mean(valid_depths) if valid_depths.size > 0 else .1
+
     @staticmethod
     def _scale_depth_map(depth_map, ref_objects, known_width_cm):
         if not ref_objects:
@@ -71,46 +73,33 @@ class HybridPortionEstimator:
         ref_width_pixels = best_ref["box"][2] - best_ref["box"][0]
         scale_ratio = known_width_cm/ref_width_pixels
         return depth_map*scale_ratio
-    def estimate_portion(self, image, food_boxes, food_labels, masks=None):
-        """
-        Hybrid estimation pipeline:
-        1. Reference scale detection
-        2. Food-specific density lookup
-        3. Depth-aware volume estimation
-        4. Nutritional mapping
-        """
-        # Convert BGR to RGB
+
+    def _get_reference_scale(self, image:np.ndarray):
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        # 1. Detect reference objects (plates, credit cards, etc.)
         ref_objects = self._detect_reference_objects(img_rgb)
-        # 2. Calculate pixel-to-cm ratio
-        scale_ratio = self._calculate_scale(ref_objects, known_width_cm=8.5)
-        # 3. Get depth map
-        depth_map = self._get_depth_map(img_rgb)
-        scaled_depth_map = self._scale_depth_map(depth_map, ref_objects, known_width_cm=8.5)
+        return self._calculate_scale(ref_objects, known_width_cm = 8.5)
+
+    def _get_scaled_depth_map(self, image, scale_ratio):
+        depth_map = self._get_depth_map(image)
+        return depth_map * scale_ratio
+
+    def estimate_portion(self, image, food_boxes, food_labels, masks=None):
+        scale_ratio = self._get_reference_scale(image)
+        depth_map = self._get_scaled_depth_map(image, scale_ratio)
         portions = []
-        for idx,(box, label) in enumerate(zip(food_boxes, food_labels)):
+        for idx, (box, label) in enumerate(zip(food_boxes, food_labels)):
             if masks and idx < len(masks):
-                mask_area = np.sum(masks[idx])
-                area_cm2 = mask_area*(scale_ratio**2)
-                depth_cm = self._get_region_depth(scaled_depth_map, masks[idx])
+                area_cm2 = np.sum(masks[idx]) * (scale_ratio ** 2)
+                depth_cm = self._get_region_depth(depth_map, masks[idx])
             else:
-                # Fallback to bbox area
-                w = box[2]-box[0]
-                h = box[3]-box[1]
-                area_cm2 = (w*h)*(scale_ratio**2)
-                depth_cm = self._get_region_depth(scaled_depth_map, None, box)
-            # 4. Food specific density
+                w, h = box[2] - box[0], box[3] - box[1]
+                area_cm2 = (w*h) * (scale_ratio ** 2)
+                depth_cm = self._get_region_depth(depth_map, masks[idx])
             density = self._get_food_density(label)
             volume_cm3 = area_cm2 * depth_cm
             weight_g = volume_cm3 * density
             calories = self._estimate_calories(label, weight_g)
-            portions.append({
-                "weight":weight_g,
-                "calories":calories,
-                "volume":volume_cm3,
-                "bounding_box":box
-            })
+            portions.append({"weight":weight_g, "calories": calories, "volume": volume_cm3, "bounding_box": box})
         return portions
 
     def _detect_reference_objects(self, image):
@@ -129,11 +118,10 @@ class HybridPortionEstimator:
                 })
         return ref_objects
 
-    @staticmethod
-    def _calculate_scale(ref_objects, known_width_cm):
+    def _calculate_scale(self, ref_objects, known_width_cm):
         """calculate scale using best reference object"""
         if not ref_objects:
-            return 22/640 # Fallback default
+            return self.fallback_scale # Fallback default
 
         # Select most confident reference object
         best_ref = max(ref_objects, key=lambda x:x["confidence"]*(x["box"][2] - x["box"][0]))
@@ -171,23 +159,18 @@ class HybridPortionEstimator:
         }
         physical_size = reference_sizes.get(best_ref["label"], known_width_cm)
         return physical_size/ref_width
+
     def _get_depth_map(self, image:np.ndarray) -> np.ndarray:
         """Get depth map using MiDaS with caching for more performance"""
-        img_hash = hash(image.tobytes())
+        img_hash = hashlib.sha256(image.tobytes()).hexdigest()
         # Check if having a cached result
         if img_hash in self.depth_cache:
             return self.depth_cache[img_hash]
-
-        img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        img_tensor = self.midas_transform(img).to(self.device)
-
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img_tensor = self.midas_transform(img_rgb).to(self.device)
         with torch.no_grad():
             depth = self.midas(img_tensor).squeeze().cpu().numpy()
-
-        if len(self.depth_cache) > 10:
-            self.depth_cache.pop(next(iter(self.depth_cache)))
         self.depth_cache[img_hash] = depth
-
         return depth
 
     @staticmethod
@@ -217,10 +200,17 @@ class HybridPortionEstimator:
         return weight_g*1.5 # Fallback 1.5 cal/g
 
 class UECVolumeEstimator:
-    def __init__(self, food_shape_priors = None):
+    def __init__(self, food_shape_priors = None, priors_file = None, confidence_weights = None):
         self.shape_mapper = UEC256ShapeMapper()
         self.food_shape_priors = self.shape_mapper.category_map
+        self.confidence_weights = confidence_weights or {"mask":0.4, "depth":0.4, "shape":0.2}
         # self.food_shape_priors = food_shape_priors or self._get_default_shape_prior()
+
+    def load_shape_priors(self, file_path:str):
+        import json
+        with open(file_path, "r") as f:
+            self.food_shape_priors.update(json.load(f))
+
     @staticmethod
     def _get_default_shape_prior():
         """Define shape priors for common UEC-256 food categories
@@ -249,6 +239,11 @@ class UECVolumeEstimator:
                 'volume_modifier': 0.85
             }
         }
+    @staticmethod
+    def _calculate_base_area(mask, reference_scale):
+        area_pixels = np.sum(mask)
+        return area_pixels * (reference_scale ** 2)
+
     def estimate_volume(self, depth_map, mask, food_class, reference_scale):
         """
         Estimate food volume using depth map, segmentation mask, and food-specific priors.
@@ -267,10 +262,7 @@ class UECVolumeEstimator:
         # shape_prior = self.food_shape_priors.get(food_class, self.food_shape_priors["default"])
         shape_prior = self.shape_mapper.get_shape_prior(food_class)
         # Calculate base metrics
-        area_pixels = np.sum(mask)
-        area_cm2 = area_pixels*(reference_scale**2)
-
-        shape_type = shape_prior.shape if hasattr(shape_prior, "shape") else "irregular"
+        area_cm2 = self._calculate_base_area(mask, reference_scale)
 
         if shape_prior.shape== 'dome':
             volume = self._estimate_dome_volume(depth_map, mask, area_cm2, shape_prior)
@@ -282,7 +274,6 @@ class UECVolumeEstimator:
             volume = self._estimate_irregular_volume(depth_map, mask, area_cm2, shape_prior, reference_scale)
         # Calculate confidence based on factors
         confidence = self._calculate_confidence(mask, depth_map, shape_prior)
-
         return volume, confidence
     @staticmethod
     def _estimate_dome_volume(depth_map, mask, area_cm2, prior):
@@ -294,6 +285,7 @@ class UECVolumeEstimator:
         radius = np.sqrt(area_cm2 / np.pi)
         volume = (1 / 3) * np.pi * height * (3 * radius ** 2 + height ** 2)
         return volume*prior.volume_modifier
+
     @staticmethod
     def _estimate_bowl_content_volume(depth_map, mask, area_cm2, prior):
         """Estimate volume for food served in bowls"""
@@ -371,20 +363,18 @@ class UECVolumeEstimator:
         except Exception as e:
             return mask_points
 
-
     def _calculate_confidence(self, mask, depth_map, prior):
         """Calculate confidence score for volume estimation"""
         # Factors affecting confidence:
         # 1. Mask quality (continuity, size)
         mask_quality = self._assess_mask_quality(mask)
-
         # 2. Depth consistency
         depth_quality = self._assess_depth_quality(depth_map, mask)
-
         # 3. Shape prior reliability
         shape_confidence = 0.9 if prior.shape != 'irregular' else 0.7
-
-        return mask_quality * 0.4 + depth_quality * 0.4 + shape_confidence * 0.2
+        return (mask_quality * self.confidence_weights["mask"] +
+                depth_quality * self.confidence_weights["depth"] +
+                shape_confidence * self.confidence_weights["shape"])
 
     @staticmethod
     def _assess_mask_quality(mask):
@@ -403,6 +393,7 @@ class UECVolumeEstimator:
         if num_features>3:
             return .7      # Multiple disconnected regions
         return .9
+
     @staticmethod
     def _assess_depth_quality(depth_map, mask):
         """Assess quality of depth map measurements"""
@@ -427,6 +418,7 @@ class UnifiedFoodEstimator:
         self.hybrid_estimator = HybridPortionEstimator()
         self.uec_estimator = UECVolumeEstimator()
         self.food_category_map = self._load_uec_categories()
+
     def _load_uec_categories(self):
         """
         Loads category mapping from a file (e.g., 'category.txt')
@@ -451,6 +443,18 @@ class UnifiedFoodEstimator:
             # Default mapping if file not found
             mapping = {i:f"Category_{i}" for i in range(1,257)}
         return mapping
+
+    def _calculate_nutrition(self, volume, food_class, density):
+        nutrition = {}
+        if self.hybrid_estimator.nutrition_mapper:
+            try:
+                nutrition = self.hybrid_estimator.nutrition_mapper.map_food_label_to_nutrition(food_class) or {}
+            except (KeyError, ConnectionError) as e:
+                logging.warning(f"Failed to get nutrition for {food_class}: {e}")
+        calories_per_100g = nutrition.get("calories_per_100g", 150)
+        weight_g = volume * density
+        calories = (weight_g / 100) * calories_per_100g
+        return weight_g, calories
 
     def estimate(self, image, detections):
         """Unified estimation pipeline
@@ -477,6 +481,7 @@ class UnifiedFoodEstimator:
                     food_class=food_class,
                     reference_scale=self.hybrid_estimator.get_scale(image)
                 )
+                method = "uec_prior"
             else:
                 # Fallback to hybrid method with a default confidence
                 portion = self.hybrid_estimator.estimate_portion(
@@ -485,27 +490,19 @@ class UnifiedFoodEstimator:
                     food_labels=[food_class],
                     masks=[food["mask"]] if "mask" in food else None)[0]
                 volume = portion["volume"]
-                confidence = 0.7
-            # Add nutrition data from hybrid system
-            nutrition = {}
-            if self.hybrid_estimator.nutrition_mapper:
-                try:
-                    nutrition = self.hybrid_estimator.nutrition_mapper.map_food_label_to_nutrition(food_class) or {}
-                except Exception as e:
-                    logging.warning(f"Failed to get nutrition for {food_class}: {e}")
-                    nutrition = {}
+                mask_quality = self.uec_estimator._assess_mask_quality(food["mask"])
+                depth_quality = self.uec_estimator._assess_depth_quality(depth_map, food["depth"])
+                confidence = (mask_quality * 0.5 + depth_quality * 0.5)
+                method = "hybrid"
 
-            calories_per_100g = nutrition.get("calories_per_100g", 150)  # Default 150 cal/100g
-            calories_per_cm3 = nutrition.get("calories_per_cm3", calories_per_100g / 100)
             density = self.hybrid_estimator._get_food_density(food_class)
-            weight_g = volume * density
-            calories = (weight_g / 100) * calories_per_100g
+            weight_g, calories = self._calculate_nutrition(volume, food_class, density)
 
             results.append({
                 'volume': volume,
                 'weight_g': weight_g,
                 'calories': calories,
                 'confidence': confidence,
-                'method': 'uec_prior' if food_class in self.uec_estimator.food_shape_priors else 'hybrid'
+                'method': method
             })
         return results
