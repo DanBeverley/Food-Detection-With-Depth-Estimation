@@ -17,6 +17,7 @@ class TooManyRequestsError(Exception):
 class NutritionMapper:
     def __init__(self, api_key:str,redis_url: str = "redis://localhost:6379",
                  cache_file:str="nutrition_cache.csv") -> None:
+        # TODO: adjust both api_key and cache_file before cloud GPU usage . Also set up REDIS
         """
         Initializes the NutritionWrapper
         Args:

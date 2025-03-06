@@ -24,6 +24,7 @@ from tqdm import tqdm
 class FoodGANDataset(Dataset):
     def __init__(self, root_dir:str,image_dir:str="images",
                  mask_dir:str="masks", transform:Callable=None, image_ext:str=".jpg"):
+        #TODO: adjust parameters before cloud GPU usage
         self.root_dir = Path(root_dir)
         self.image_dir = self.root_dir/image_dir
         self.mask_dir = self.root_dir/mask_dir

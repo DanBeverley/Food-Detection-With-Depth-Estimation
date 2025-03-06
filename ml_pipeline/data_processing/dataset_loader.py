@@ -26,6 +26,7 @@ class UECFoodDataset(Dataset):
     def __init__(self, root_dir:Optional[str]=None,
                  transform:Optional[Callable]=None, image_ext:str=".jpg",
                  nutrition_mapper:Optional[NutritionMapper]=None, mask_threshold:int = 127) -> None:
+        #TODO: adjust parameters before cloud GPU usage
         """
         Args:
             root_dir (str): Root directory containing subfolders for each food category.

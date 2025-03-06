@@ -418,6 +418,7 @@ class UECVolumeEstimator:
 
 class UnifiedFoodEstimator:
     def __init__(self, category_path:str="category.txt"):
+        # TODO: adjust parameter before cloud GPU usage
         self.category_path = category_path
         self.hybrid_estimator = HybridPortionEstimator()
         self.uec_estimator = UECVolumeEstimator()

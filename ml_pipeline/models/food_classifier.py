@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any, Union, Tuple, List, Optional, Dict, Callable
 
@@ -22,14 +23,15 @@ class ActiveLearner:
     def __init__(self, base_dataset:UECFoodDataset, unlabeled_pool:Union[str, Path]) -> None :
         self.base_dataset = base_dataset
         self.unlabeled_pool = ImageFolder(unlabeled_pool, transform=base_dataset.transform)
-        self.pseudo_labeled = set()
+        self.pseudo_labeled = []
     def update_with_pseudo_labels(self, pseudo_labeled_data: List[Tuple[str, int]]):
         """Add pseudo-labeled samples to the training dataset"""
         for path, label in pseudo_labeled_data:
-            self.pseudo_labeled.add((path, label))
+            index = next(i for i, (p, _) in enumerate(self.unlabeled_pool.imgs) if p == path)
+            self.pseudo_labeled.append(index)
         self.current_dataset = ConcatDataset([
             self.base_dataset,
-            Subset(self.unlabeled_pool, list(self.pseudo_labeled))
+            Subset(self.unlabeled_pool, self.pseudo_labeled)
         ])
 
 class FoodClassifier:
@@ -230,7 +232,7 @@ class FoodClassifier:
         if self.active_learner and train_loader is None:
             train_loader = DataLoader(self.active_learner.current_dataset,
                                       batch_size = 32, shuffle=True, pin_memory=True,
-                                      persistent_workers=True)
+                                      persistent_workers=True, num_workers=os.cpu_count())
         class_criterion = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
         nutrition_criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
@@ -273,7 +275,7 @@ class FoodClassifier:
 
         for images, (labels, nutrition) in train_loader:
             images = images.to(self.device)
-            labels = labels.to(self.device)
+            labels  = labels.to(self.device)
             nutrition = nutrition.to(self.device)
 
             optimizer.zero_grad()
@@ -329,3 +331,11 @@ class FoodClassifier:
             for images, _ in data_loader:
                 images = images.to(self.device)
                 self.model(images)
+
+    def collate_with_paths(batch):
+        from torch.utils.data.dataloader import default_collate
+        images, labels = default_collate(batch)
+        paths = [sample[0] for sample in batch]
+        return images, labels, paths
+
+

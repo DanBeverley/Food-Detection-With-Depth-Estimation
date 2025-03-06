@@ -1,6 +1,7 @@
 import torch.nn.functional as F
 import torch.utils.data
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from configs.config_loader import get_params
 from ml_pipeline.data_processing.dataset_loader import *
@@ -279,7 +280,8 @@ class FoodTrainingSystem:
         """Generate pseudo labels and update the dataset"""
         pool_loader = DataLoader(self.classifier.active_learner.unlabeled_pool,
                                  batch_size = self.config_params["training"]["batch_size"], shuffle=False,
-                                 num_workers = self.config_params["training"]["num_workers"], pin_memory=True)
+                                 num_workers = self.config_params["training"]["num_workers"], pin_memory=True,
+                                 collate_fn=self.classifier.collate_with_paths())
         pseudo_labels = self.classifier.pseudo_label_samples(pool_loader, confidence_threshold=0.95)
         logging.info(f"Added {len(pseudo_labels)} pseudo-labeled samples")
         # Update active learner with pseudo labeled data

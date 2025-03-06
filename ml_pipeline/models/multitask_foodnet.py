@@ -76,7 +76,7 @@ class MultiTaskFoodNet(nn.Module):
         # Initialize weights with Xavier initialization due to sigmoid
         def init_weights(m: nn.Module) -> None:
             if isinstance(m, nn.Linear):
-                torch.nn.init.xavier_normal_(m.weight)
+                torch.nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
                 if m.bias is not None:
                     m.bias.data.fill_(0.0)
 

@@ -6,7 +6,7 @@ from torch import nn
 from torch.ao.quantization import quantize_dynamic
 import tensorrt as trt
 
-
+# TODO: run !pip install tensorrt
 class ModelOptimizer:
     @staticmethod
     def quantize_model(model:nn.Module, qconfig_spec:Tuple[type, ...]=(torch.nn.Linear, torch.nn.Conv2d),
@@ -27,7 +27,7 @@ class ModelOptimizer:
         return quantize_dynamic(model.to('cpu'), qconfig_spec, dtype=dtype)
 
     @staticmethod
-    def export_onnx(model:nn.Module, input_shape:Tuple[int,...],
+    def export_onnx(model:nn.Module, input_shape:Tuple[int,...]=(3, 224, 224),
                     onnx_path:str="model.onnx", dynamic_axes: Optional[Dict[str, Dict[int, str]]] = None) -> None:
         """
         Export the model to ONNX format.
@@ -51,14 +51,14 @@ class ModelOptimizer:
             raise
 
     @staticmethod
-    def export_tensorrt(onnx_path:str, input_shape:Tuple[int, ...]=(3, 640, 640),precision:str="FP32",
+    def export_tensorrt(onnx_path:str, input_shape:Tuple[int, ...]=(1, 3, 224, 224),precision:str="FP32",
                         output_path:str="model.trt", max_batch_size:int=1) -> trt.ICudaEngine:
         """
         Export an ONNX model to a TensorRT engine.
 
         Args:
             onnx_path (str): Path to the ONNX model.
-            input_shape (Tuple[int, ...]): Shape of the input tensor (including batch dimension).
+            input_shape (Tuple[int, ...]): Shape of  the input tensor (including batch dimension).
             output_path (str): Path to save the TensorRT engine.
 
         Returns:

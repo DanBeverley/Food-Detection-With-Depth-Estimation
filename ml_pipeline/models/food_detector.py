@@ -77,7 +77,10 @@ class FoodDetector:
 
     def _setup_tensorrt(self) -> None:
         try:
-            if Path("yolov8.trt").exists():
+            trt_path = "/kaggle/input/yolo8-trt/yolo8.trt"
+            if not Path(trt_path).exists():
+                trt_path = "yolov8.trt"
+            if Path(trt_path).exists():
                 self.trt_logger = trt.Logger(trt.Logger.WARNING)
                 self.trt_engine = self._load_trt_engine()
                 self.context = self.trt_engine.create_execution_context()
@@ -87,9 +90,10 @@ class FoodDetector:
                 logging.info("TensorRT engine loaded successfully")
             else:
                 logging.warning("TensorRT engine not found, using Pytorch model")
-                self.build_trt_engine()
+                self.use_trt = False
         except Exception as e:
             logging.error(f"TensorRT setup failed: {e}")
+            self.use_trt = False
             self.trt_engine = None
             self.stream = cuda.Stream()
             self.bindings = []
@@ -136,9 +140,8 @@ class FoodDetector:
                 for output in self.outputs:
                     cuda.memcpy_dtoh_async(output["host"], output["device"], self.stream)
                 self.stream.synchronize()
-                batch_results = self._parse_trt_output(self.outputs[0]["host"], return_masks=True,
-                                                       original_shape=batch[0].shape[:2])
-                results.extend([batch_results[i+i+1] for i in range(len(batch))]) # Split results per image
+                batch_results = self._parse_trt_output(self.outputs[0]["host"], len(batch),  return_masks=True,)
+                results.extend(batch_results) # Split results per image
             else:
                 # Preprocess batch for Pytorch
                 batch_images = [self.preprocess_image(img) for img in batch]
@@ -228,7 +231,7 @@ class FoodDetector:
         raw_output = self.outputs[0]["host"]
         return self._parse_trt_output(raw_output, return_masks, image.shape[:2])
 
-    def _parse_trt_output(self, raw_outputs:np.ndarray, return_masks:bool, original_shape:Tuple)->List[Dict[str, Union[np.ndarray, float, int]]]:
+    def _parse_trt_output(self, raw_outputs:np.ndarray, batch_size:int, return_masks:bool)->List[Dict[str, Union[np.ndarray, float, int]]]:
         """
         Parse raw TensorRT output into detection dictionaries.
 
@@ -241,24 +244,17 @@ class FoodDetector:
             List of detection dictionaries with keys 'bbox', 'confidence', and 'class_id'.
         """
         try:
-            detections = []
-            detection_tensor = raw_outputs[0] if isinstance(raw_outputs, list) else raw_outputs
-                # Process detection tensor
-            for det in detection_tensor:
-                if det[1] >= self.conf_threshold: # Confidence check
+            detections_per_image = [[] for _ in range(batch_size)]
+            num_detections = raw_outputs.shape[0] // batch_size
+            for i in range(raw_outputs.shape[0]):
+                batch_idx = i//num_detections
+                det = raw_outputs[i]
+                if det[i] >= self.conf_threshold:
                     class_id = int(det[0])
                     confidence = float(det[1])
-                    x1 = det[2] * original_shape[1]
-                    y1 = det[3] * original_shape[0]
-                    x2 = det[4] * original_shape[1]
-                    y2 = det[4] * original_shape[0]
-                    detection = {"bbox":[float(x1), float(y1), float(x2), float(y2)],
-                                 "confidence":confidence,
-                                 "class_id":class_id}
-                    if return_masks:
-                        logging.warning("Masks not supported in current TensorRT parsing")
-                    detections.append(detection)
-            return detections
+                    bbox = [float(det[2]), float(det[3]), float(det[4]), float(det[5])]
+                    detections_per_image[batch_idx].append({"bbox":bbox, "confidence":confidence, "class_id":class_id})
+            return detections_per_image
         except Exception as e:
             logging.error(f"Failed to parse TensorRT output: {e}")
             raise
@@ -285,7 +281,7 @@ class FoodDetector:
         confs = result.boxes.conf.cpu().numpy()
         classes = result.boxes.cls.cpu().numpy()
 #        masks = result.masks if return_masks and hasattr(result, "masks") else None
-        masks = result.masks if return_masks and not result.is_only_xyxy else None
+        masks = result.masks if return_masks and hasattr(result, "masks") and result.masks is not None else None
         for i in range(len(boxes.shape[0])):
             box = boxes[i].tolist()
             confidence = confs[i].item()
