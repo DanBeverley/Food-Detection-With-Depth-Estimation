@@ -3,8 +3,7 @@ from albumentations.pytorch import ToTensorV2
 
 def get_train_transforms():
     return A.Compose([
-        A.Resize(height=640, width=640),
-        A.RandomCrop(height=224, width=224),
+        A.Resize(height=224, width=224),
         A.HorizontalFlip(p=0.5),
         A.RandomBrightnessContrast(p=0.2),
         A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, p=0.5),

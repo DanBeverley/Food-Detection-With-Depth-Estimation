@@ -201,12 +201,12 @@ class FoodTrainingSystem:
     def _forward_pass(self, val_images, val_targets):
         """Forward pass through both models"""
         with torch.no_grad():
-            numpy_images = val_images.cpu().numpy().transpose(0, 2, 3, 1)
             detections = self.detector.model(val_images)
         outputs = self.classifier.model(val_images)
-        assert "portion" in outputs, "Missing portion data in targets"
-        assert "nutrition" in outputs, "Missing nutrition output"
-        assert "class" in outputs, "Missing class output"
+        required_keys = ["labels", "nutrition", "portions"]
+        for key in required_keys:
+            if key not in val_targets:
+                raise ValueError(f"Missing key '{key}' in val_targets")
         return self._calculate_loss(outputs, val_targets, detections)
 
     def _calculate_loss(self, outputs, val_targets, detections) -> float:
@@ -216,7 +216,7 @@ class FoodTrainingSystem:
         nutrition_loss = F.mse_loss(outputs["nutrition"][:, :3],
                                     val_targets["nutrition"][:, :3])
         portion_loss = .7 + F.l1_loss(outputs["portion"], val_targets["portions"]) + \
-                       .3 + F.mse_loss(outputs["portions"], val_targets["portions"])
+                       .3 + F.mse_loss(outputs["portion"], val_targets["portions"])
         return (
                 weights["classification"] * cls_loss +
                 weights["nutrition"] * nutrition_loss +
@@ -228,7 +228,7 @@ class FoodTrainingSystem:
         return (
             self.config_params["training"]["qat_enabled"] and
             epoch == self.config_params["training"]["qat_start_epoch"] and
-            not hasattr(self, 'qat_initialized')
+            not getattr(self, "qat_initialized", False)
         )
 
     def _reinitialized_optimization(self):

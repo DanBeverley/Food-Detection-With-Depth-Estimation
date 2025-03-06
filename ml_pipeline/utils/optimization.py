@@ -22,11 +22,9 @@ class ModelOptimizer:
          Returns:
             nn.Module: The quantized model.
         """
-        return quantize_dynamic(
-            model.to('cpu'),
-            qconfig_spec,
-            dtype=dtype
-        )
+        if next(model.parameters()).device.type != "cpu":
+            raise RuntimeError("Model must be on CPU for dynamic quantization")
+        return quantize_dynamic(model.to('cpu'), qconfig_spec, dtype=dtype)
 
     @staticmethod
     def export_onnx(model:nn.Module, input_shape:Tuple[int,...],
@@ -53,8 +51,8 @@ class ModelOptimizer:
             raise
 
     @staticmethod
-    def export_tensorrt(onnx_path:str, input_shape:Tuple[int, ...]=(3, 640, 640),
-                        output_path:str="model.trt") -> trt.ICudaEngine:
+    def export_tensorrt(onnx_path:str, input_shape:Tuple[int, ...]=(3, 640, 640),precision:str="FP32",
+                        output_path:str="model.trt", max_batch_size:int=1) -> trt.ICudaEngine:
         """
         Export an ONNX model to a TensorRT engine.
 
@@ -70,6 +68,10 @@ class ModelOptimizer:
         builder = trt.Builder(logger)
         config = builder.create_builder_config()
         config.max_workspace_size = 1<<30 # 1 GB
+        if precision == "FP16" and builder.platform_has_fast_fp16:
+            config.set_flag(trt.BuilderFlag.FP16)
+        elif precision == "INT8" and builder.platform_has_fast_int8:
+            config.set_flag(trt.BuilderFlag.INT8)
         network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
 
         # Parse ONNX model
@@ -77,9 +79,8 @@ class ModelOptimizer:
         with open(onnx_path, "rb") as model_file:
             if not parser.parse(model_file.read()):
                 logging.error("Failed to parse ONNX model")
-                for error in range(parser.num_errors):
-                    logging.error(parser.get_error(error))
                 raise RuntimeError("ONNX parsing failed")
+        builder.max_batch_size = max_batch_size
         # Build engine
         try:
             engine = builder.build_engine(network, config)
