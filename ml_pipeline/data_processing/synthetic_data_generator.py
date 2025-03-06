@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import csv
@@ -38,7 +39,9 @@ class FoodGANDataset(Dataset):
             logging.warning(f"Found {missing_masks} images without corresponding masks")
     def __len__(self):
         return len(self.image_paths)
-    def __getitem__(self, idx):
+    def __getitem__(self, idx:int, retries:int=0):
+        if retries > 10:
+            raise RuntimeError("Too many consecutive bad samples")
         try:
             img = cv2.imread(str(self.image_paths[idx]))
             if img is None:
@@ -49,7 +52,7 @@ class FoodGANDataset(Dataset):
             return self.transform(image=np.array(img), mask = np.array(mask))
         except Exception as e:
             logging.warning(f"Skipping sample {self.image_paths[idx]}: {e}")
-            return self.__getitem__((idx + 1) % len(self))  # Return next valid sample
+            return self.__getitem__((idx + 1) % len(self), retries + 1)  # Return next valid sample
 
 class Generator(nn.Module):
     def __init__(self, nz:int=100, ngf:int=64, nc:int=3):
@@ -192,7 +195,7 @@ class GANTrainer:
             generation_params: Dictionary of generation parameters (optional)
         """
         if self.nutrition_mapper:
-            food_categories = await self.nutrition_mapper.map_food_label_to_nutrition(fake_label) or {}
+            food_categories = list(self.nutrition_mapper.density_db.keys())
         else:
             food_categories = ["default_food"]
         fake_label = np.random.choice(food_categories)
@@ -200,7 +203,7 @@ class GANTrainer:
         nutrition = {}
         if self.nutrition_mapper:
             try:
-                nutrition = self.nutrition_mapper.map_food_label_to_nutrition(fake_label) or {}
+                nutrition = asyncio.run(self.nutrition_mapper.map_food_label_to_nutrition(fake_label)) or {}
             except Exception as e:
                 logging.warning(f"Failed to get nutrition for {fake_label}: {e}")
                 nutrition = {}

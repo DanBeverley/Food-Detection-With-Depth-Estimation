@@ -21,6 +21,7 @@ from pathlib import Path
 import logging
 
 nest_asyncio.apply()
+
 class UECFoodDataset(Dataset):
     def __init__(self, root_dir:Optional[str]=None,
                  transform:Optional[Callable]=None, image_ext:str=".jpg",
@@ -54,6 +55,7 @@ class UECFoodDataset(Dataset):
             asyncio.run(self._load_nutrition_data_async())
             self._validate_nutrition_data()
         self._load_dataset()
+
     async def _load_nutrition_data_async(self) -> None:
         """Async nutrition data loading with parallel requests"""
         if not self.nutrition_mapper:
@@ -63,7 +65,7 @@ class UECFoodDataset(Dataset):
             tasks = [self.nutrition_mapper.map_food_label_to_nutrition(cat) for cat in self.id_to_category.values()]
             results = await asyncio.gather(*tasks, return_exceptions = True)
             for cat, result in zip(self.id_to_category.values(), results):
-                if isinstance(results, Exception):
+                if isinstance(result, Exception):
                     logging.warning(f"Error mapping nutrition for {cat}: {result}")
                 else:
                     self.nutrition_cache[cat] = result
@@ -205,7 +207,16 @@ class UECFoodDataset(Dataset):
                     continue
                 valid_bboxes.append([x1, y1, x2, y2])
                 valid_labels.append(labels[i])
-                area = (mask[y1:y2, x1:x2].sum() if mask is not None else (x2 - x1)*(y2 - y1))
+                if mask is not None:
+                    x1, y1, x2, y2 = map(int, [x1. y1, x2, y2])
+                    x1, y2 = max(0, x1), min(width, x2)
+                    y1, y2 = max(0, y1), min(height, y2)
+                    if x1 < x2 and y1 < y2:
+                        area = mask[y1:y2, x1:x2].sum()
+                    else:
+                        area = (x2 - x1) * (y2 - y1)
+                else:
+                    area = (x2 - x1) * (y2 - y1)
                 portion = self._estimate_portion(food_name, area)
                 valid_portions.append(portion)
 

@@ -87,7 +87,7 @@ class NutritionMapper:
 
     async def _get_cached_data(self, query:str) -> Optional[Dict[str, float]]:
         """Check caches for nutrition data, return None if not found"""
-        cache_key = f"nutrition :{query.lower()}"
+        cache_key = f"nutrition:{query.lower()}"
         # Local cache
         if query.lower() in self.cache:
             return self.cache[query.lower()]
@@ -101,7 +101,7 @@ class NutritionMapper:
                 logging.warning("Redis connection failed")
         return None
 
-    async def get_nutrition_data(self, query: str, max_concurrent: int = 5) -> Dict[str, float]:
+    async def get_nutrition_data(self, query: str) -> Dict[str, float]:
         """Fetch nutrition data for a single query with caching"""
         cached = await self._get_cached_data(query)
         if cached is not None:
@@ -124,13 +124,14 @@ class NutritionMapper:
         # Fetch missing queries in parallel
         if missing_queries:
             sem = asyncio.Semaphore(max_concurrent)
-            async def fetch_with_limit(query:str) -> tuple[str, Dict[str, float]]:
+
+            async def fetch_with_limit(query: str) -> tuple[str, Dict[str, float]]:
                 async with sem:
                     nutrition = await self.get_nutrition_data(query)
                     return query, nutrition
                 tasks = [fetch_with_limit(query) for query in missing_queries]
                 fetched = await asyncio.gather(*tasks)
-                results.update(fetched)
+                results.update(dict(fetched))
         return results
 
     @staticmethod
@@ -166,7 +167,8 @@ class NutritionMapper:
     async def map_food_label_to_nutrition(self, food_labels: str) -> Dict[str, float]:
         """Async version with caching and fallback"""
         nutritions = await self.get_nutrition_data(food_labels)
-        if not any(nutritions[k] for k in ["calories", "protein", "fat", "carbohydrates"]):
+        required_keys = ["calories", "protein", "fat", "carbohydrates"]
+        if not all(k in nutritions for k in required_keys):
           logging.warning(f"No nutrition data found for {food_labels}, using default nutrition")
           return self.get_default_nutrition()
         density = self.density_db.get(food_labels.lower(), 0.05)

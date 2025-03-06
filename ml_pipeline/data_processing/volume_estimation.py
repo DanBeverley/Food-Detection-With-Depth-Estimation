@@ -7,15 +7,15 @@ import torch
 from scipy.spatial import ConvexHull
 from shape_mapping import ShapePrior
 from cachetools import LRUCache
+from typing import List, Optional, Dict
 from ml_pipeline.data_processing.shape_mapping import UEC256ShapeMapper
 
 class HybridPortionEstimator:
-    def __init__(self, device=None, nutrition_mapper=None, fallback_scale:float= 22/640):
+    def __init__(self, device=None, nutrition_mapper=None, fallback_scale:float= 22/800):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.nutrition_mapper = nutrition_mapper
         self.fallback_scale = fallback_scale
         self.depth_cache = LRUCache(maxsize=100) # For a larger, more efficient caching
-        self.depth_cache = {}
         self.models_loaded = False
         # Food type to density mapping (g/cm³)
         self.density_db = {
@@ -42,7 +42,10 @@ class HybridPortionEstimator:
             self.models_loaded = True
         except Exception as e:
             logging.error(f"Model loading failed: {e}")
-            raise RuntimeError("Failed to load models")
+            logging.warning("Using fallback mode without pre-trained models")
+            self.ref_detector = None  # Minimal fallback; adjust as needed
+            self.midas = None
+            self.models_loaded = False
 
     def get_scale(self, image):
         """
@@ -83,7 +86,8 @@ class HybridPortionEstimator:
         depth_map = self._get_depth_map(image)
         return depth_map * scale_ratio
 
-    def estimate_portion(self, image, food_boxes, food_labels, masks=None):
+    def estimate_portion(self, image: np.ndarray, food_boxes: List[List[float]],
+                        food_labels: List[str], masks: Optional[List[np.ndarray]] = None) -> List[Dict]:
         scale_ratio = self._get_reference_scale(image)
         depth_map = self._get_scaled_depth_map(image, scale_ratio)
         portions = []
