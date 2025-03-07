@@ -1,16 +1,14 @@
+import json
 import asyncio
 import os
+from functools import lru_cache
 from typing import Callable, Any, Optional, Iterable, List, Tuple
-
 import aiohttp
 import nest_asyncio
-
 from shape_mapping import UEC256ShapeMapper
-
 import cv2
 import numpy as np
 from collections import defaultdict
-
 import torch
 from torch.utils.data import Dataset
 from typing import Dict
@@ -209,7 +207,7 @@ class UECFoodDataset(Dataset):
                 valid_bboxes.append([x1, y1, x2, y2])
                 valid_labels.append(labels[i])
                 if mask is not None:
-                    x1, y1, x2, y2 = map(int, [x1. y1, x2, y2])
+                    x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
                     x1, y2 = max(0, x1), min(width, x2)
                     y1, y2 = max(0, y1), min(height, y2)
                     if x1 < x2 and y1 < y2:
@@ -277,3 +275,74 @@ def collate_fn(batch:Iterable[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]) -> 
     return torch.stack(images, dim = 0), {"detection": detection_targets,
                                           "nutrition": torch.stack(nutrition_targets, dim = 0)}
 
+
+class FoodMaskDataset(Dataset):
+    """Dataset class for FoodMask format"""
+    def __init__(self, root_dir:str, transform:Optional[Callable] = None, nutrition_mapper:NutritionMapper = None,  mask_threshold:int = 127) -> None:
+        """
+        Args:
+            root_dir (str): Root directory containing images and masks.
+            transform (callable, optional): Albumentations transformation pipeline.
+            nutrition_mapper (NutritionMapper, optional) : Mapper for nutrition data
+            mask_threshold (int): Threshold for binarizing masks (127 by default)
+        """
+        self.root_dir = Path(root_dir)
+        self.transform = transform or get_train_transforms()
+        self.nutrition_mapper = nutrition_mapper
+        self.mask_threshold = mask_threshold
+        self.nutrition_cache: Dict[str, Dict[str, float]] = {}
+        self.data: List[Dict] = []  # For each dict correspond to one image
+        self.id_to_category = {} # Mapping numerical id to category name
+        # Load category mapping
+        self._load_categories()
+        if self.nutrition_mapper:
+            UECFoodDataset._load_nutrition_data_async()
+        self._load_dataset()
+
+    def _load_categories(self):
+        categories_file = self.root_dir/"categories.json"
+        if categories_file.exists():
+            with open(categories_file, "r") as f:
+                categories = json.load(f)
+            for cat in categories:
+                self.id_to_category[cat["id"]] = cat["name"]
+        else:
+            logging.warning("Categories file not found")
+
+    def  _load_dataset(self):
+        annotation_file = self.root_dir/"annotations.json"
+        if not annotation_file.exists():
+            raise FileNotFoundError(f"Annotations file not found at {annotation_file}")
+        with open(annotation_file, "r") as f:
+            data = json.load(f)
+        # Process FoodMask annotations
+        image_dict = {img["id"]: img for img in data["images"]}
+        for ann in data["annotations"]:
+            img_id = ann["image_id"]
+            if img_id not in image_dict:
+                continue
+            image_info  = image_dict[img_id]
+            image_path = self.root_dir/"images"/image_info["file_name"]
+            mask_path = self.root_dir/"mask"/image_info["file_name"].replace(".jpg", ".png")
+            # Extract bbox
+            x, y, w, h = ann["bbox"]
+            bbox = [x,y, x+w, y+h]
+            self.data.append({
+                "image_path": str(image_path),
+                "mask_path": str(mask_path),
+                "bbox": bbox,
+                "label": ann["category_id"]
+            })
+    def _process_mask(self, mask_path:str = None) -> Optional[np.ndarray]:
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                logging.warning(f"Failed to load mask at {mask_path}")
+                return None
+            mask = (mask > self.mask_threshold).astype(np.float32)
+            return mask
+    @lru_cache(maxsize=128)
+    def _load_image(self, image_path:str = None):
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Image not found: {image_path}")
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)

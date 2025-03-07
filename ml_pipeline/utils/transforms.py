@@ -27,3 +27,20 @@ def get_gan_transforms():
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ], additional_targets={'mask': 'mask'})
+
+
+def get_foodmask_transforms(height=416, width=416):
+    """Get transforms optimized for food images"""
+    from albumentations import (
+        Compose, RandomBrightnessContrast, HueSaturationValue,
+        OneOf, Resize, ShiftScaleRotate
+    )
+
+    return Compose([
+        OneOf([
+            RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2),
+            HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20),
+        ], p=0.7),
+        ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+        Resize(height=height, width=width),
+    ])
