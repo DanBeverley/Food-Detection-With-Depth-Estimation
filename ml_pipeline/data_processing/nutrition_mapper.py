@@ -59,11 +59,14 @@ class NutritionMapper:
 
     async def close(self) -> None:
         await self.session.close()
+
     async def __aenter__(self) -> "NutritionMapper":
         return self
+
     async def __aexit__(self, exc_type: Any, exc_val:Any, exc_tb:Any) -> None:
         await self.close()
 
+    @retry(wait=wait_exponential(multiplier=1, min=1, max=10), stop=stop_after_attempt(3))
     async def _fetch_from_api(self, query:str)->Dict[str, float]:
         """Fetch nutrition data from USDA API for a single query"""
         params = {"api_key": self.api_key, "query":query, "pageSize":1}
@@ -130,10 +133,31 @@ class NutritionMapper:
                 async with sem:
                     nutrition = await self.get_nutrition_data(query)
                     return query, nutrition
-                tasks = [fetch_with_limit(query) for query in missing_queries]
-                fetched = await asyncio.gather(*tasks)
-                results.update(dict(fetched))
+            tasks = [fetch_with_limit(query) for query in missing_queries]
+            fetched = await asyncio.gather(*tasks, return_exceptions = True)
+            for query, result in fetched:
+                if isinstance(result, Exception):
+                    logging.error(f"Failed to fetch nutrition data for {query}: {result}")
+                    results[query] = self.get_default_nutrition()
+                else:
+                    results[query] = result
+            results.update(dict(fetched))
         return results
+
+    def get_cached_nutrition(self, query: str) -> Optional[Dict[str, float]]:
+        """Get cached nutrition data synchronously"""
+        if query.lower() in self.cache:
+          return self.cache.get(query.lower())
+        if self.redis:
+            try:
+                cache_key = f"nutrition:{query.lower()}"
+                cached = self.redis.get(cache_key)
+                if cached:
+                    return json.loads(cached)
+            except Exception as e:
+                logging.error(f"Redis error: {e}")
+        logging.debug(f"No cached nutrition data for {query}, using default")
+        return self.get_default_nutrition()
 
     @staticmethod
     def _parse_nutrition_data(food_item: Dict[str, Any]) -> Dict[str, float]:
@@ -188,6 +212,9 @@ class NutritionMapper:
             with open(self.cache_file, "r", newline="", encoding="utf-8") as csvfile:
                 reader = csv.DictReader(csvfile)
                 required_keys = ["label", "calories", "protein", "fat", "carbohydrates"]
+                if not required_keys.issubset(reader.fieldnames):
+                    logging.error(f"CSV missing required columns: {required_keys - set(reader.fieldnames)}")
+                    return cache
                 for row in reader:
                     try:
                         label = row["label"].lower()
